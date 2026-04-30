@@ -9,8 +9,36 @@ permissions:
   contents: read
 
 jobs:
+  check_secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      integration_ready: ${{ steps.check.outputs.integration_ready }}
+    steps:
+      - id: check
+        shell: bash
+        env:
+          FIBERY_TEST_WORKSPACE: ${{ secrets.FIBERY_TEST_WORKSPACE }}
+          FIBERY_TEST_WORKSPACE_HOST: ${{ secrets.FIBERY_TEST_WORKSPACE_HOST }}
+          FIBERY_TEST_TOKEN: ${{ secrets.FIBERY_TEST_TOKEN }}
+        run: |
+          missing=()
+
+          [ -n "$FIBERY_TEST_WORKSPACE" ] || missing+=("FIBERY_TEST_WORKSPACE")
+          [ -n "$FIBERY_TEST_WORKSPACE_HOST" ] || missing+=("FIBERY_TEST_WORKSPACE_HOST")
+          [ -n "$FIBERY_TEST_TOKEN" ] || missing+=("FIBERY_TEST_TOKEN")
+
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "integration_ready=true" >> "$GITHUB_OUTPUT"
+            echo "Integration tests will run." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "integration_ready=false" >> "$GITHUB_OUTPUT"
+          echo "Integration tests skipped. Missing secrets: ${missing[*]}." >> "$GITHUB_STEP_SUMMARY"
+
   integration:
-    if: ${{ secrets.FIBERY_TEST_WORKSPACE != '' && secrets.FIBERY_TEST_WORKSPACE_HOST != '' && secrets.FIBERY_TEST_TOKEN != '' }}
+    needs: check_secrets
+    if: ${{ needs.check_secrets.outputs.integration_ready == 'true' }}
     runs-on: ubuntu-latest
     env:
       FIBERY_TEST_WORKSPACE: ${{ secrets.FIBERY_TEST_WORKSPACE }}
