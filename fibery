@@ -1,0 +1,2340 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx"]
+# ///
+
+"""
+fibery - CLI for Fibery workspaces
+
+Replaces the Fibery MCP server with a standalone Python CLI.
+Reads API tokens from --token, FIBERY_TOKEN, or macOS Keychain.
+
+Examples:
+    fibery myworkspace date
+    fibery myworkspace dbs
+    fibery myworkspace describe "Task Management/Task"
+    fibery myworkspace query "Task Management/Task" --where 'State=Open' --limit 5
+    fibery myworkspace create "Task Management/Task" --fields '{"Name":"hello"}'
+    fibery myworkspace comments <entity-id>
+    fibery myworkspace doc <secret> --format md
+    fibery myworkspace schema dump
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+
+# ---------- Workspace + credentials ----------
+
+KEYCHAIN_SERVICE = "mcp-credentials"
+CONFIG_ENV_VAR = "FIBERY_CONFIG_FILE"
+
+EXIT_OK = 0
+EXIT_USER_ERROR = 1
+EXIT_API_ERROR = 2
+EXIT_AUTH_ERROR = 3
+
+
+def config_path() -> Path:
+    override = os.environ.get(CONFIG_ENV_VAR)
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "fibery-cli" / "config.json"
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except OSError as exc:
+        print(f"[fibery] ERROR: Failed to read config file '{path}': {exc}", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    except json.JSONDecodeError as exc:
+        print(f"[fibery] ERROR: Invalid JSON in config file '{path}': {exc}", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    if not isinstance(data, dict):
+        print(f"[fibery] ERROR: Config file '{path}' must contain a JSON object", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    return data
+
+
+def _mapping_lookup(mapping: Any, key: str) -> Any:
+    if not isinstance(mapping, dict):
+        return None
+    for name, value in mapping.items():
+        if isinstance(name, str) and name.lower() == key.lower():
+            return value
+    return None
+
+
+def _available_workspace_aliases(config: dict[str, Any]) -> list[str]:
+    aliases: set[str] = set()
+    for section in ("workspaces", "workspace_hosts"):
+        mapping = config.get(section)
+        if isinstance(mapping, dict):
+            aliases.update(name for name in mapping if isinstance(name, str))
+    return sorted(aliases)
+
+
+def normalize_host(host: str) -> str:
+    value = host.strip()
+    if value.startswith("https://"):
+        value = value.removeprefix("https://")
+    elif value.startswith("http://"):
+        value = value.removeprefix("http://")
+    return value.rstrip("/")
+
+
+def resolve_host(workspace: str, *, workspace_host: str | None = None, config: dict[str, Any] | None = None) -> str:
+    if workspace_host:
+        return normalize_host(workspace_host)
+
+    config = config or {}
+    workspace_entry = _mapping_lookup(config.get("workspaces"), workspace)
+    if isinstance(workspace_entry, dict):
+        host = workspace_entry.get("host")
+        if isinstance(host, str) and host.strip():
+            return normalize_host(host)
+
+    host = _mapping_lookup(config.get("workspace_hosts"), workspace)
+    if isinstance(host, str) and host.strip():
+        return normalize_host(host)
+
+    print(
+        f"[fibery] ERROR: Unknown workspace '{workspace}'. "
+        f"Add it to '{config_path()}' or pass --workspace-host.",
+        file=sys.stderr,
+    )
+    available = _available_workspace_aliases(config)
+    if available:
+        print(f"[fibery] Available aliases: {', '.join(available)}", file=sys.stderr)
+    sys.exit(EXIT_USER_ERROR)
+
+
+def resolve_keychain_account(
+    workspace: str,
+    host: str,
+    *,
+    config: dict[str, Any] | None = None,
+) -> str:
+    env_account = os.environ.get("FIBERY_KEYCHAIN_ACCOUNT")
+    if env_account:
+        return env_account
+
+    config = config or {}
+    workspace_entry = _mapping_lookup(config.get("workspaces"), workspace)
+    if isinstance(workspace_entry, dict):
+        account = workspace_entry.get("keychain_account")
+        if isinstance(account, str) and account.strip():
+            return account
+
+    account = _mapping_lookup(config.get("keychain_accounts"), host)
+    if isinstance(account, str) and account.strip():
+        return account
+
+    return f"fibery-{workspace.lower()}"
+
+
+def get_token(
+    host: str,
+    *,
+    workspace: str,
+    token: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> str:
+    if token:
+        return token
+
+    env_token = os.environ.get("FIBERY_TOKEN")
+    if env_token:
+        return env_token
+
+    account = resolve_keychain_account(workspace, host, config=config)
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    print(
+        f"[fibery] ERROR: No credential found for workspace '{workspace}'. "
+        "Use --token, set FIBERY_TOKEN, or configure macOS Keychain access.",
+        file=sys.stderr,
+    )
+    print(
+        f"[fibery] macOS Keychain example: security add-generic-password -U -a {account} "
+        f"-s {KEYCHAIN_SERVICE} -w 'TOKEN'",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_AUTH_ERROR)
+
+
+# ---------- HTTP context ----------
+
+@dataclass
+class Ctx:
+    workspace: str
+    host: str
+    token: str
+    client: httpx.Client
+
+    def url(self, path: str) -> str:
+        return f"https://{self.host}{path}"
+
+    def headers(self, content_type: str = "application/json") -> dict[str, str]:
+        return {
+            "Authorization": f"Token {self.token}",
+            "Content-Type": content_type,
+        }
+
+
+def http_error(response: httpx.Response) -> None:
+    """Print a helpful error and exit."""
+    status = response.status_code
+    body = response.text[:500]
+    if status == 401:
+        print("[fibery] ERROR: 401 Unauthorized - token expired or invalid", file=sys.stderr)
+        print(
+            "[fibery] Refresh the token and retry with --token, FIBERY_TOKEN, "
+            "or your configured credential store.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_AUTH_ERROR)
+    if status == 429:
+        retry = response.headers.get("retry-after", "?")
+        print(f"[fibery] ERROR: 429 Rate limited (retry-after: {retry}s)", file=sys.stderr)
+        print("[fibery] Fibery limits: 3 req/sec per token, 7 req/sec per workspace", file=sys.stderr)
+        sys.exit(EXIT_API_ERROR)
+    print(f"[fibery] ERROR: HTTP {status}: {body}", file=sys.stderr)
+    sys.exit(EXIT_API_ERROR)
+
+
+def post_commands(ctx: Ctx, commands: list[dict[str, Any]]) -> list[Any]:
+    """POST /api/commands - returns list of results (one per command)."""
+    r = ctx.client.post(ctx.url("/api/commands"), headers=ctx.headers(), json=commands, timeout=30.0)
+    if not r.is_success:
+        http_error(r)
+    data = r.json()
+    if not isinstance(data, list):
+        return [data]
+    return data
+
+
+def post_command(ctx: Ctx, command: str, args: dict[str, Any] | None = None) -> Any:
+    """POST a single command and return its result (unwrapped from success wrapper)."""
+    payload = [{"command": command, "args": args or {}}]
+    results = post_commands(ctx, payload)
+    if not results:
+        print(f"[fibery] ERROR: Empty response from {command}", file=sys.stderr)
+        sys.exit(EXIT_API_ERROR)
+    res = results[0]
+    if isinstance(res, dict) and res.get("success") is False:
+        message = res.get("result") or res.get("message") or res
+        print(f"[fibery] ERROR: Command {command} failed: {json.dumps(message, indent=2, default=str)}", file=sys.stderr)
+        sys.exit(EXIT_API_ERROR)
+    if isinstance(res, dict) and "result" in res:
+        return res["result"]
+    return res
+
+
+# ---------- Output ----------
+
+def emit(data: Any, fmt: str = "json") -> None:
+    if fmt == "raw":
+        print(json.dumps(data, default=str))
+    elif fmt == "table":
+        print_table(data)
+    else:
+        print(json.dumps(data, indent=2, default=str))
+
+
+def print_table(data: Any) -> None:
+    """Basic table printing for lists of dicts. Falls back to JSON."""
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        print(json.dumps(data, indent=2, default=str))
+        return
+    cols = list(data[0].keys())
+    widths = {c: max(len(str(c)), max(len(str(row.get(c, ""))) for row in data)) for c in cols}
+    header = " | ".join(c.ljust(widths[c]) for c in cols)
+    sep = "-+-".join("-" * widths[c] for c in cols)
+    print(header)
+    print(sep)
+    for row in data:
+        print(" | ".join(str(row.get(c, "")).ljust(widths[c]) for c in cols))
+
+
+# ---------- Commands ----------
+
+def cmd_date(ctx: Ctx, args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc)
+    emit({
+        "iso": now.isoformat(),
+        "date": now.date().isoformat(),
+        "workspace": ctx.workspace,
+        "host": ctx.host,
+    }, args.output)
+
+
+def cmd_dbs(ctx: Ctx, args: argparse.Namespace) -> None:
+    """List databases (types) in the workspace.
+
+    Default filters (matching fibery MCP tool behavior):
+      - Domain types only (fibery/domain?: True)
+      - Exclude types in the fibery/* system namespace
+      - Exclude soft-deleted types (name ending in _deleted or containing _NxN_deleted)
+
+    Use --all to bypass the filter and see every type in the workspace.
+    """
+    result = post_command(ctx, "fibery.schema/query", {"with-description?": False})
+    types = result.get("fibery/types", []) if isinstance(result, dict) else result or []
+    databases = []
+    for t in types:
+        name = t.get("fibery/name", "")
+        meta = t.get("fibery/meta", {}) or {}
+        is_domain = meta.get("fibery/domain?", False)
+        is_enum = meta.get("fibery/enum?", False)
+        if not args.all:
+            if not is_domain or is_enum:
+                continue
+            # System namespace
+            if name.startswith("fibery/"):
+                continue
+            # Soft-deleted types have '_deleted' in the name
+            if "_deleted" in name:
+                continue
+        databases.append({
+            "name": name,
+            "domain": is_domain,
+            "secured": meta.get("fibery/secured?", False),
+            "color": meta.get("ui/color", ""),
+        })
+    databases.sort(key=lambda d: d["name"])
+    emit(databases, args.output)
+
+
+def _get_type(ctx: Ctx, type_name: str) -> dict[str, Any]:
+    """Fetch a single type's schema by name."""
+    result = post_command(ctx, "fibery.schema/query", {"with-description?": True})
+    types = result.get("fibery/types", []) if isinstance(result, dict) else []
+    for t in types:
+        if t.get("fibery/name") == type_name:
+            return t
+    print(f"[fibery] ERROR: Type '{type_name}' not found in workspace {ctx.host}", file=sys.stderr)
+    sys.exit(EXIT_USER_ERROR)
+
+
+def cmd_describe(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Describe the fields and metadata of a single database type."""
+    target = _get_type(ctx, args.type)
+    fields_out = []
+    for f in target.get("fibery/fields", []):
+        fields_out.append({
+            "name": f.get("fibery/name"),
+            "type": f.get("fibery/type"),
+            "meta": f.get("fibery/meta", {}),
+        })
+    emit({
+        "name": target.get("fibery/name"),
+        "meta": target.get("fibery/meta", {}),
+        "field_count": len(fields_out),
+        "fields": fields_out,
+    }, args.output)
+
+
+def _parse_where(clause: str) -> tuple[str, str, str]:
+    """Parse 'Field=value', 'Field!=value', 'Field>value', etc."""
+    for op in ["!=", ">=", "<=", "=", ">", "<"]:
+        if op in clause:
+            field, value = clause.split(op, 1)
+            return op, field.strip(), value.strip()
+    print(f"[fibery] ERROR: Invalid --where clause '{clause}' (expected Field=value)", file=sys.stderr)
+    sys.exit(EXIT_USER_ERROR)
+
+
+def _coerce(value: str, hint: str | None) -> Any:
+    """Coerce --where value based on optional type hint: int, float, bool, null.
+
+    Default is string. Use 'Field:int=5' to force int. This avoids surprises
+    with text fields that happen to contain numeric characters (e.g.
+    fibery/public-id is text but looks like a number).
+    """
+    if hint is None or hint == "str":
+        return value
+    if hint == "int":
+        return int(value)
+    if hint == "float":
+        return float(value)
+    if hint == "bool":
+        return value.lower() in ("true", "1", "yes", "y")
+    if hint == "null":
+        return None
+    print(f"[fibery] ERROR: Unknown type hint ':{hint}' (allowed: int, float, bool, null, str)", file=sys.stderr)
+    sys.exit(EXIT_USER_ERROR)
+
+
+def _parse_field_hint(field: str) -> tuple[str, str | None]:
+    """Split 'Field:int' into ('Field', 'int'). Returns (field, None) if no hint."""
+    if ":" in field and not field.startswith("fibery/"):
+        parts = field.rsplit(":", 1)
+        if parts[1] in ("int", "float", "bool", "null", "str"):
+            return parts[0], parts[1]
+    return field, None
+
+
+def _build_select(select_arg: str | None) -> dict[str, Any]:
+    """Convert a comma-separated --select into a Fibery q/select dict.
+
+    Field paths can use dots for nested traversal: `State.enum/name`.
+    Always includes fibery/id and fibery/public-id unless explicitly listed.
+    """
+    if not select_arg:
+        return {
+            "fibery/id": ["fibery/id"],
+            "fibery/public-id": ["fibery/public-id"],
+        }
+    result: dict[str, Any] = {}
+    has_id = False
+    for field in [f.strip() for f in select_arg.split(",") if f.strip()]:
+        path = field.split(".")
+        result[field] = path
+        if field == "fibery/id":
+            has_id = True
+    if not has_id:
+        result["fibery/id"] = ["fibery/id"]
+    return result
+
+
+def cmd_query(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Query entities from a database with --where/--select/--limit, or raw --json-query."""
+    if args.json_query:
+        query = json.loads(args.json_query)
+        params = json.loads(args.params) if args.params else {}
+    else:
+        query: dict[str, Any] = {"q/from": args.type, "q/select": _build_select(args.select)}
+        params: dict[str, Any] = {}
+        if args.where:
+            conditions = []
+            for i, w in enumerate(args.where):
+                op, raw_field, value = _parse_where(w)
+                field, hint = _parse_field_hint(raw_field)
+                param_name = f"$p{i}"
+                params[param_name] = _coerce(value, hint)
+                field_path = field.split(".")
+                conditions.append([op, field_path, param_name])
+            query["q/where"] = conditions[0] if len(conditions) == 1 else ["q/and"] + conditions
+        if args.order_by:
+            direction = "q/desc" if args.order_desc else "q/asc"
+            query["q/order-by"] = [[[args.order_by], direction]]
+        query["q/limit"] = args.limit
+        if args.offset:
+            query["q/offset"] = args.offset
+
+    result = post_command(ctx, "fibery.entity/query", {"query": query, "params": params})
+    emit(result, args.output)
+
+
+def _load_fields(fields_arg: str | None, fields_file: str | None) -> dict[str, Any]:
+    if fields_file:
+        with open(fields_file) as f:
+            return json.load(f)
+    if fields_arg:
+        return json.loads(fields_arg)
+    return {}
+
+
+def cmd_create(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Create a single entity in a database."""
+    fields = _load_fields(args.fields, args.fields_file)
+    if not fields:
+        print("[fibery] ERROR: create requires --fields or --fields-file", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    result = post_command(ctx, "fibery.entity/create", {
+        "type": args.type,
+        "entity": fields,
+    })
+    emit(result, args.output)
+
+
+def cmd_update(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Update an entity by ID. --type is required because Fibery demands it."""
+    fields = _load_fields(args.fields, args.fields_file)
+    entity = {"fibery/id": args.id, **fields}
+    result = post_command(ctx, "fibery.entity/update", {
+        "type": args.type,
+        "entity": entity,
+    })
+    emit(result, args.output)
+
+
+def cmd_batch_create(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Create many entities using fibery.entity.batch/create."""
+    with open(args.file) as f:
+        entities = json.load(f)
+    if not isinstance(entities, list):
+        print("[fibery] ERROR: batch-create file must be a JSON array of entities", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    result = post_command(ctx, "fibery.entity.batch/create", {
+        "type": args.type,
+        "entities": entities,
+    })
+    emit(result, args.output)
+
+
+def cmd_delete(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Delete an entity by ID. Destructive - requires --yes."""
+    if not args.yes:
+        print("[fibery] ERROR: delete requires --yes to confirm destructive operation", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    result = post_command(ctx, "fibery.entity/delete", {
+        "type": args.type,
+        "entity": {"fibery/id": args.id},
+    })
+    emit(result, args.output)
+
+
+def cmd_batch_delete(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Delete many entities by ID. Uses fibery.entity.batch/delete."""
+    if not args.yes:
+        print("[fibery] ERROR: batch-delete requires --yes", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    ids = [i.strip() for i in args.ids.split(",") if i.strip()]
+    result = post_command(ctx, "fibery.entity.batch/delete", {
+        "type": args.type,
+        "entities": [{"fibery/id": i} for i in ids],
+        "opts": {"fail-if-not-found?": False},
+    })
+    emit(result, args.output)
+
+
+def cmd_link(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Add items to a collection/relation field on an entity."""
+    if args.by_name:
+        items = _resolve_items_by_name(ctx, args.type, args.field, args.by_name)
+    else:
+        ids = [i.strip() for i in args.items.split(",") if i.strip()]
+        items = [{"fibery/id": i} for i in ids]
+    result = post_command(ctx, "fibery.entity/add-collection-items", {
+        "type": args.type,
+        "entity": {"fibery/id": args.id},
+        "field": args.field,
+        "items": items,
+    })
+    emit(result, args.output)
+
+
+def cmd_unlink(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Remove items from a collection/relation field on an entity."""
+    if args.by_name:
+        items = _resolve_items_by_name(ctx, args.type, args.field, args.by_name)
+    else:
+        ids = [i.strip() for i in args.items.split(",") if i.strip()]
+        items = [{"fibery/id": i} for i in ids]
+    result = post_command(ctx, "fibery.entity/remove-collection-items", {
+        "type": args.type,
+        "entity": {"fibery/id": args.id},
+        "field": args.field,
+        "items": items,
+    })
+    emit(result, args.output)
+
+
+def _resolve_items_by_name(ctx: Ctx, holder_type: str, field_name: str, names_csv: str) -> list[dict[str, Any]]:
+    """Look up target entities by name for --by-name on link/unlink.
+
+    Inspects the field's target type from schema, queries for entities
+    matching the provided names, returns their fibery/id entries.
+    """
+    schema = post_command(ctx, "fibery.schema/query", {})
+    types = schema.get("fibery/types", [])
+    target_type = None
+    for t in types:
+        if t.get("fibery/name") != holder_type:
+            continue
+        for f in t.get("fibery/fields", []):
+            if f.get("fibery/name") == field_name:
+                target_type = f.get("fibery/type")
+                break
+        break
+    if not target_type:
+        print(f"[fibery] ERROR: field '{field_name}' not found on '{holder_type}'", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+
+    # Find the title field on the target type
+    title_field = None
+    for t in types:
+        if t.get("fibery/name") != target_type:
+            continue
+        for f in t.get("fibery/fields", []):
+            meta = f.get("fibery/meta", {}) or {}
+            if meta.get("ui/title?"):
+                title_field = f.get("fibery/name")
+                break
+        # Enum types use enum/name
+        if not title_field:
+            for f in t.get("fibery/fields", []):
+                if f.get("fibery/name") == "enum/name":
+                    title_field = "enum/name"
+                    break
+        break
+
+    if not title_field:
+        print(f"[fibery] ERROR: cannot find title field on '{target_type}'", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+
+    names = [n.strip() for n in names_csv.split(",") if n.strip()]
+    conditions = [["=", [title_field], f"$n{i}"] for i, _ in enumerate(names)]
+    where = conditions[0] if len(conditions) == 1 else ["q/or"] + conditions
+    params = {f"$n{i}": n for i, n in enumerate(names)}
+
+    result = post_command(ctx, "fibery.entity/query", {
+        "query": {
+            "q/from": target_type,
+            "q/select": {"fibery/id": ["fibery/id"], "name": [title_field]},
+            "q/where": where,
+            "q/limit": len(names) + 10,
+        },
+        "params": params,
+    })
+    if not result:
+        print(f"[fibery] ERROR: no entities found matching {names} in {target_type}", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    return [{"fibery/id": r["fibery/id"]} for r in result]
+
+
+# ---------- Space management (undocumented: fibery.app/save) ----------
+
+def cmd_space(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Manage spaces: create, list, delete."""
+    import uuid as _uuid
+
+    op = args.space_op
+    if op == "list":
+        result = post_command(ctx, "fibery.entity/query", {
+            "query": {
+                "q/from": "fibery/app",
+                "q/select": {
+                    "fibery/id": ["fibery/id"],
+                    "fibery/name": ["fibery/name"],
+                    "fibery/title": ["fibery/title"],
+                    "fibery/status": ["fibery/status"],
+                    "fibery/color": ["fibery/color"],
+                    "fibery/icon": ["fibery/icon"],
+                    "fibery/version": ["fibery/version"],
+                },
+                "q/limit": 200,
+            },
+        })
+        # Filter out system apps unless --all
+        if not args.all:
+            result = [a for a in result
+                      if a.get("fibery/name") not in ("fibery", "Collaboration~Documents")
+                      and not a.get("fibery/name", "").startswith("fibery/")]
+        emit(result, args.output)
+        return
+
+    if op == "create":
+        space_id = str(_uuid.uuid4())
+        payload = [{
+            "command": "fibery.command/batch",
+            "args": {
+                "commands": [
+                    {
+                        "command": "fibery.app/save",
+                        "args": {
+                            "app": {
+                                "fibery/id": space_id,
+                                "fibery/name": args.name,
+                                "fibery/title": args.name,
+                                "fibery/namespace": args.name,
+                                "fibery/description": args.description or "",
+                                "fibery/version": "1.0.0",
+                                "fibery/show-in-menu?": True,
+                                "fibery/color": args.color or "#F7D130",
+                                "fibery/icon": args.icon or "puzzle-piece",
+                                "fibery/status": "app/installed",
+                                "fibery/categories": [],
+                                "fibery/created-by": "",
+                                "fibery/schema": {
+                                    "fibery/name": args.name,
+                                    "fibery/types": [],
+                                },
+                            }
+                        }
+                    },
+                    {
+                        "command": "fibery.app/install",
+                        "args": {"name": args.name, "version": "1.0.0"},
+                    },
+                ]
+            }
+        }]
+        results = post_commands(ctx, payload)
+        emit({"created": args.name, "id": space_id, "result": results}, args.output)
+        return
+
+    if op == "delete":
+        if not args.yes:
+            print("[fibery] ERROR: space delete requires --yes", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        # Resolve space name to ID
+        spaces = post_command(ctx, "fibery.entity/query", {
+            "query": {
+                "q/from": "fibery/app",
+                "q/select": {"fibery/id": ["fibery/id"], "fibery/name": ["fibery/name"]},
+                "q/where": ["=", ["fibery/name"], "$n"],
+                "q/limit": 1,
+            },
+            "params": {"$n": args.name},
+        })
+        if not spaces:
+            print(f"[fibery] ERROR: space '{args.name}' not found", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        app_id = spaces[0]["fibery/id"]
+
+        # Delete all types in the space first
+        schema = post_command(ctx, "fibery.schema/query", {})
+        space_types = [t["fibery/name"] for t in schema.get("fibery/types", [])
+                       if t["fibery/name"].startswith(f"{args.name}/")
+                       and (t.get("fibery/meta", {}) or {}).get("fibery/domain?")]
+        if space_types:
+            del_cmds = [{"command": "schema.type/delete", "args": {
+                "name": tn, "delete-entities?": True, "delete-related-fields?": True,
+            }} for tn in space_types]
+            post_command(ctx, "fibery.schema/batch", {"commands": del_cmds})
+
+        # Uninstall then delete
+        post_command(ctx, "fibery.app/uninstall", {"fibery/id": app_id})
+        post_command(ctx, "fibery.app/delete", {"fibery/id": app_id})
+        emit({"deleted": args.name, "id": app_id, "types_removed": space_types}, args.output)
+        return
+
+    if op == "update":
+        spaces = post_command(ctx, "fibery.entity/query", {
+            "query": {
+                "q/from": "fibery/app",
+                "q/select": {"fibery/id": ["fibery/id"]},
+                "q/where": ["=", ["fibery/name"], "$n"],
+                "q/limit": 1,
+            },
+            "params": {"$n": args.name},
+        })
+        if not spaces:
+            print(f"[fibery] ERROR: space '{args.name}' not found", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        app_id = spaces[0]["fibery/id"]
+        update = {"fibery/id": app_id}
+        if args.color:
+            update["fibery/color"] = args.color
+        if args.icon:
+            update["fibery/icon"] = args.icon
+        result = post_command(ctx, "fibery.command/batch", {"commands": [
+            {"command": "fibery.app/update", "args": update},
+        ]})
+        emit({"updated": args.name, "id": app_id, "result": result}, args.output)
+        return
+
+
+# ---------- Event sequence (undocumented) ----------
+
+def cmd_event_seq(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Get the current event sequence ID for incremental sync."""
+    result = post_command(ctx, "fibery.event/last-sequence-id", {})
+    emit({"sequence_id": result, "workspace": ctx.workspace}, args.output)
+
+
+# ---------- Automation management (undocumented REST) ----------
+
+def cmd_automation(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Manage automations via REST API."""
+    op = args.auto_op
+    if op == "list":
+        r = ctx.client.get(
+            ctx.url(f"/api/automations/auto-rules/for-type/{args.type_id}"),
+            headers=ctx.headers(),
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+    if op == "triggers":
+        r = ctx.client.get(
+            ctx.url(f"/api/automations/auto-rules/for-type/{args.type_id}/triggers"),
+            headers=ctx.headers(),
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+    if op == "actions":
+        r = ctx.client.get(
+            ctx.url(f"/api/automations/auto-rules/for-type/{args.type_id}/actions"),
+            headers=ctx.headers(),
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+    if op == "create":
+        body = json.loads(args.body) if args.body else {}
+        if args.body_file:
+            with open(args.body_file) as f:
+                body = json.load(f)
+        r = ctx.client.post(
+            ctx.url(f"/api/automations/auto-rules/for-type/{args.type_id}"),
+            headers=ctx.headers(),
+            json=body,
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+    if op == "get":
+        r = ctx.client.get(
+            ctx.url(f"/api/automations/auto-rules/{args.rule_id}"),
+            headers=ctx.headers(),
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+
+# ---------- Batch doc fetch + incremental sync ----------
+
+def cmd_docs_batch(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Fetch multiple documents in a single API call using the undocumented
+    POST /api/documents/commands endpoint with get-documents command.
+
+    Falls back to sequential single-doc fetches if the batch endpoint fails.
+    """
+    if args.secrets_file:
+        with open(args.secrets_file) as f:
+            secrets = [line.strip() for line in f if line.strip()]
+    elif args.secrets:
+        secrets = [s.strip() for s in args.secrets.split(",") if s.strip()]
+    elif not sys.stdin.isatty():
+        secrets = [line.strip() for line in sys.stdin if line.strip()]
+    else:
+        print("[fibery] ERROR: docs-batch needs --secrets, --secrets-file, or stdin", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+
+    fmt = args.format
+    r = ctx.client.post(
+        ctx.url(f"/api/documents/commands?format={fmt}"),
+        headers=ctx.headers(),
+        json={"command": "get-documents", "args": [{"secret": s} for s in secrets]},
+        timeout=60.0,
+    )
+    if r.is_success:
+        data = r.json()
+        if isinstance(data, list):
+            for doc in data:
+                print(json.dumps(doc, default=str))
+            return
+    # Fallback to sequential
+    import time as _time
+    for i, secret in enumerate(secrets):
+        try:
+            doc = _get_document(ctx, secret, fmt)
+            print(json.dumps(doc, default=str))
+        except SystemExit:
+            print(json.dumps({"secret": secret, "_error": "fetch failed"}))
+        if i < len(secrets) - 1:
+            _time.sleep(0.35)
+
+
+def cmd_docs_sync(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Incremental doc sync using entity modification-date as change signal.
+
+    Queries entities modified since last run, fetches their doc content,
+    saves to a local cache directory. State file tracks last-run timestamp.
+    """
+    import time as _time
+    from pathlib import Path
+
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    state_file = cache_dir / ".sync-state.json"
+
+    # Load last-run timestamp
+    last_run = None
+    if state_file.exists():
+        with open(state_file) as f:
+            state = json.load(f)
+            last_run = state.get("last_run")
+
+    # Query entities, optionally filtered by modification date
+    query: dict[str, Any] = {
+        "q/from": args.type,
+        "q/select": {
+            "fibery/id": ["fibery/id"],
+            "fibery/modification-date": ["fibery/modification-date"],
+            "doc-secret": [args.field, "Collaboration~Documents/secret"],
+        },
+        "q/order-by": [[["fibery/modification-date"], "q/asc"]],
+        "q/limit": args.limit,
+    }
+    params: dict[str, Any] = {}
+
+    if last_run and not args.full:
+        query["q/where"] = [">", ["fibery/modification-date"], "$since"]
+        params["$since"] = last_run
+
+    entities = post_command(ctx, "fibery.entity/query", {"query": query, "params": params})
+
+    if not entities:
+        emit({"synced": 0, "since": last_run, "message": "no changes"}, args.output)
+        return
+
+    fmt = args.format
+    synced = 0
+    errors = 0
+    for i, entity in enumerate(entities):
+        eid = entity.get("fibery/id", "unknown")
+        secret = entity.get("doc-secret")
+        if not secret:
+            continue
+        try:
+            doc = _get_document(ctx, secret, fmt)
+            content = doc.get("content", "") if isinstance(doc, dict) else doc
+            out_file = cache_dir / f"{eid}.{fmt}"
+            with open(out_file, "w") as f:
+                if fmt == "json":
+                    json.dump(content, f, indent=2, default=str)
+                else:
+                    f.write(content if isinstance(content, str) else json.dumps(content))
+            synced += 1
+        except SystemExit:
+            errors += 1
+        if i < len(entities) - 1:
+            _time.sleep(0.35)
+
+    # Update state
+    latest_mod = max(e.get("fibery/modification-date", "") for e in entities)
+    with open(state_file, "w") as f:
+        json.dump({"last_run": latest_mod, "synced": synced, "errors": errors}, f)
+
+    emit({
+        "synced": synced,
+        "errors": errors,
+        "since": last_run,
+        "latest": latest_mod,
+        "cache_dir": str(cache_dir),
+    }, args.output)
+
+
+# ---------- View management (JSON-RPC) ----------
+
+def _view_rpc(ctx: Ctx, method: str, params: dict[str, Any]) -> Any:
+    """Call /api/views/json-rpc with a method and params."""
+    r = ctx.client.post(
+        ctx.url("/api/views/json-rpc"),
+        headers=ctx.headers(),
+        json={"jsonrpc": "2.0", "method": method, "params": params, "id": f"cli-{method}"},
+        timeout=30.0,
+    )
+    if not r.is_success:
+        http_error(r)
+    data = r.json()
+    if "error" in data:
+        print(f"[fibery] ERROR: {method}: {data['error'].get('message', data['error'])}", file=sys.stderr)
+        sys.exit(EXIT_API_ERROR)
+    return data.get("result", data)
+
+
+def cmd_view(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Manage views via /api/views/json-rpc."""
+    op = args.view_op
+    if op == "list":
+        body = {
+            "jsonrpc": "2.0",
+            "method": "query-views",
+            "params": {"withoutMeta": False, "withoutDescription": False, "includeDbScreenViews": True},
+            "id": "cli-view-list",
+        }
+        if args.space_id:
+            body["params"]["filter"] = {"fibery/container-app": {"fibery/id": args.space_id}}
+        r = ctx.client.post(
+            ctx.url("/api/views/json-rpc"),
+            headers=ctx.headers(),
+            json=body,
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        data = r.json()
+        emit(data.get("result", data), args.output)
+        return
+
+    if op == "create":
+        view_def = json.loads(args.body) if args.body else {}
+        if args.body_file:
+            with open(args.body_file) as f:
+                view_def = json.load(f)
+        if not view_def:
+            print("[fibery] ERROR: view create needs --body or --body-file", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        views = view_def if isinstance(view_def, list) else [view_def]
+        result = _view_rpc(ctx, "create-views", {"views": views})
+        emit(result, args.output)
+        return
+
+    if op == "rename":
+        result = _view_rpc(ctx, "update-views", {"updates": [{"id": args.id, "values": {"fibery/name": args.name}}]})
+        emit({"renamed": args.id, "name": args.name, "result": result}, args.output)
+        return
+
+    if op == "delete":
+        if not args.yes:
+            print("[fibery] ERROR: view delete requires --yes", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        ids = [i.strip() for i in args.ids.split(",") if i.strip()]
+        result = _view_rpc(ctx, "delete-views", {"ids": ids})
+        emit({"deleted": ids, "result": result}, args.output)
+        return
+
+    if op == "move-to-folder":
+        result = _view_rpc(ctx, "update-views", {"updates": [{"id": args.id, "values": {"fibery/Folder": args.folder_id}}]})
+        emit({"moved": args.id, "folder": args.folder_id, "result": result}, args.output)
+        return
+
+    if op == "create-folder":
+        import uuid as _uuid
+        result = _view_rpc(ctx, "create-folders", {"values": [{
+            "fibery/id": str(_uuid.uuid4()),
+            "fibery/name": args.name,
+            "fibery/rank": 6683349842739893,
+            "fibery/container-app": {"fibery/id": args.space_id},
+            "fibery/private?": False,
+            "fibery/Parent Folder": None,
+        }]})
+        emit(result, args.output)
+        return
+
+    if op == "rename-folder":
+        result = _view_rpc(ctx, "update-folders", {"updates": [{"id": args.id, "values": {"fibery/name": args.name}}]})
+        emit({"renamed": args.id, "name": args.name, "result": result}, args.output)
+        return
+
+    if op == "list-folders":
+        result = _view_rpc(ctx, "query-folders", {})
+        emit(result, args.output)
+        return
+
+    if op == "create-smart-folder":
+        import uuid as _uuid
+        result = _view_rpc(ctx, "create-smart-folders", {"values": [{
+            "fibery/id": str(_uuid.uuid4()),
+            "fibery/app": {"fibery/id": args.space_id},
+            "fibery/name": args.name,
+            "fibery/rank": 6683349843739893,
+            "fibery/meta": {"items": []},
+            "includeViews": [],
+            "includeFolders": [],
+            "fibery/Parent Folder": None,
+        }]})
+        emit(result, args.output)
+        return
+
+
+# ---------- Button management (REST) ----------
+
+def cmd_button(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Manage automation buttons via REST API."""
+    op = args.button_op
+    if op == "list":
+        r = ctx.client.get(
+            ctx.url(f"/api/automations/buttons/for-type/{args.type_id}"),
+            headers=ctx.headers(),
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+    if op == "actions":
+        r = ctx.client.get(
+            ctx.url(f"/api/automations/buttons/for-type/{args.type_id}/actions"),
+            headers=ctx.headers(),
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+    if op == "create":
+        body = json.loads(args.body) if args.body else {}
+        if args.body_file:
+            with open(args.body_file) as f:
+                body = json.load(f)
+        r = ctx.client.post(
+            ctx.url(f"/api/automations/buttons/for-type/{args.type_id}"),
+            headers=ctx.headers(),
+            json=body,
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+
+# ---------- Tier 2: advanced read ----------
+
+def _get_document(ctx: Ctx, secret: str, fmt: str) -> dict[str, Any]:
+    """GET /api/documents/{secret}?format=md|html|json"""
+    r = ctx.client.get(
+        ctx.url(f"/api/documents/{secret}"),
+        headers=ctx.headers(),
+        params={"format": fmt},
+        timeout=30.0,
+    )
+    if not r.is_success:
+        http_error(r)
+    return r.json()
+
+
+def cmd_doc(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Fetch rich-text document content by secret. Format: md (default), html, json."""
+    data = _get_document(ctx, args.secret, args.format)
+    if args.raw_content:
+        content = data.get("content", "") if isinstance(data, dict) else data
+        if args.format == "json" and not isinstance(content, str):
+            print(json.dumps(content, indent=2, default=str))
+        else:
+            print(content)
+    else:
+        emit(data, args.output)
+
+
+def cmd_doc_write(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Write rich-text document content by secret.
+
+    Uses the undocumented PUT /api/documents/{secret} endpoint discovered
+    during CLI development. Accepts markdown by default.
+    """
+    if args.content is not None:
+        content = args.content
+    elif args.content_file:
+        with open(args.content_file) as f:
+            content = f.read()
+    elif not sys.stdin.isatty():
+        content = sys.stdin.read()
+    else:
+        print("[fibery] ERROR: doc-write needs --content, --content-file, or stdin", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    r = ctx.client.put(
+        ctx.url(f"/api/documents/{args.secret}"),
+        headers=ctx.headers(),
+        json={"content": content, "format": args.format},
+        timeout=30.0,
+    )
+    if not r.is_success:
+        http_error(r)
+    emit({"secret": args.secret, "written": True, "format": args.format, "bytes": len(content)}, args.output)
+
+
+def cmd_comments(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Fetch threaded comments on an entity. Traverses comments/comments relation.
+
+    The parent type MUST have comments/comments-mixin installed. Pass --type to
+    specify the parent database. Optionally fetch comment body content with --with-content.
+    """
+    query = {
+        "q/from": args.type,
+        "q/select": {
+            "fibery/id": ["fibery/id"],
+            "comments": {
+                "q/from": ["comments/comments"],
+                "q/select": {
+                    "fibery/id": ["fibery/id"],
+                    "fibery/public-id": ["fibery/public-id"],
+                    "document-secret": ["comment/document-secret"],
+                    "author-id": ["comment/author", "fibery/id"],
+                    "author-name": ["comment/author", "user/name"],
+                    "parent-id": ["comments/parent", "fibery/id"],
+                    "created": ["fibery/creation-date"],
+                },
+                "q/limit": "q/no-limit",
+            },
+        },
+        "q/where": ["=", ["fibery/id"], "$entityId"],
+        "q/limit": 1,
+    }
+    result = post_command(ctx, "fibery.entity/query", {
+        "query": query,
+        "params": {"$entityId": args.id},
+    })
+    if not isinstance(result, list) or not result:
+        print(f"[fibery] ERROR: Entity {args.id} not found in {args.type}", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    comments = result[0].get("comments", [])
+    comments.sort(key=lambda c: c.get("created", ""))
+
+    if args.with_content:
+        for c in comments:
+            secret = c.get("document-secret")
+            if secret:
+                try:
+                    doc = _get_document(ctx, secret, args.format)
+                    c["content"] = doc.get("content", "") if isinstance(doc, dict) else doc
+                except SystemExit:
+                    c["content"] = None
+                    c["content_error"] = "failed to fetch document"
+
+    emit(comments, args.output)
+
+
+def cmd_comment_add(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Create a comment on an entity. Three steps: create comment entity with
+    a new doc secret, attach it to the parent via add-collection-items, then
+    write the content to the document.
+    """
+    import uuid as _uuid
+    doc_secret = str(_uuid.uuid4())
+
+    # Step 1: create comment entity
+    comment = post_command(ctx, "fibery.entity/create", {
+        "type": "comments/comment",
+        "entity": {"comment/document-secret": doc_secret},
+    })
+    comment_id = comment["fibery/id"]
+
+    # Step 2: attach to parent entity
+    post_command(ctx, "fibery.entity/add-collection-items", {
+        "type": args.type,
+        "entity": {"fibery/id": args.id},
+        "field": "comments/comments",
+        "items": [{"fibery/id": comment_id}],
+    })
+
+    # Step 3: write content
+    if args.content:
+        content = args.content
+    elif args.content_file:
+        with open(args.content_file) as f:
+            content = f.read()
+    elif not sys.stdin.isatty():
+        content = sys.stdin.read()
+    else:
+        content = ""
+
+    if content:
+        ctx.client.put(
+            ctx.url(f"/api/documents/{doc_secret}"),
+            headers=ctx.headers(),
+            json={"content": content, "format": "md"},
+            timeout=30.0,
+        )
+
+    emit({
+        "comment_id": comment_id,
+        "entity": args.id,
+        "type": args.type,
+        "doc_secret": doc_secret,
+        "content_length": len(content),
+    }, args.output)
+
+
+def cmd_graphql(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Execute a GraphQL query against a space-scoped endpoint."""
+    url = ctx.url(f"/api/graphql/space/{args.space}")
+    body: dict[str, Any] = {"query": args.query}
+    if args.variables:
+        body["variables"] = json.loads(args.variables)
+    r = ctx.client.post(url, headers=ctx.headers(), json=body, timeout=30.0)
+    if not r.is_success:
+        http_error(r)
+    emit(r.json(), args.output)
+
+
+def cmd_webhook(ctx: Ctx, args: argparse.Namespace) -> None:
+    """List, create, or delete webhooks."""
+    if args.webhook_op == "list":
+        r = ctx.client.get(ctx.url("/api/webhooks/v2"), headers=ctx.headers(), timeout=30.0)
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+    elif args.webhook_op == "delete":
+        if not args.yes:
+            print("[fibery] ERROR: webhook delete requires --yes", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        r = ctx.client.delete(ctx.url(f"/api/webhooks/v2/{args.webhook_id}"), headers=ctx.headers(), timeout=30.0)
+        if not r.is_success:
+            http_error(r)
+        emit({"deleted": args.webhook_id}, args.output)
+    elif args.webhook_op == "create":
+        body = json.loads(args.body) if args.body else {}
+        if args.body_file:
+            with open(args.body_file) as f:
+                body = json.load(f)
+        r = ctx.client.post(ctx.url("/api/webhooks/v2"), headers=ctx.headers(), json=body, timeout=30.0)
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+
+
+# ---------- Tier 3: schema manipulation ----------
+
+def _mandatory_base_fields(space: str) -> list[dict[str, Any]]:
+    """Return the 5 required base fields for a new Fibery type.
+
+    When the holder type is secured, Fibery rejects explicit fibery/secured?: false
+    on the child fields. Omit the flag so Fibery applies its own default.
+    """
+    return [
+        {"fibery/name": "fibery/id", "fibery/type": "fibery/uuid",
+         "fibery/meta": {"fibery/id?": True, "fibery/readonly?": True}},
+        {"fibery/name": "fibery/public-id", "fibery/type": "fibery/text",
+         "fibery/meta": {"fibery/public-id?": True, "fibery/readonly?": True}},
+        {"fibery/name": "fibery/creation-date", "fibery/type": "fibery/date-time",
+         "fibery/meta": {"fibery/creation-date?": True, "fibery/readonly?": True,
+                         "fibery/default-value": "$now"}},
+        {"fibery/name": "fibery/modification-date", "fibery/type": "fibery/date-time",
+         "fibery/meta": {"fibery/modification-date?": True, "fibery/required?": True,
+                         "fibery/readonly?": True, "fibery/default-value": "$now"}},
+        {"fibery/name": f"{space}/name", "fibery/type": "fibery/text",
+         "fibery/meta": {"ui/title?": True}},
+    ]
+
+
+def cmd_schema(ctx: Ctx, args: argparse.Namespace) -> None:
+    """Dispatch schema subcommands."""
+    op = args.schema_op
+    if op == "dump":
+        result = post_command(ctx, "fibery.schema/query", {"with-description?": True})
+        emit(result, args.output)
+        return
+
+    if op == "create-type":
+        full_name = f"{args.space}/{args.name}"
+        meta = {
+            "fibery/domain?": True,
+            "fibery/secured?": True,
+            "ui/color": args.color or "#F7D130",
+        }
+        commands = [
+            {"command": "schema.type/create", "args": {
+                "fibery/name": full_name,
+                "fibery/meta": meta,
+                "fibery/fields": _mandatory_base_fields(args.space),
+            }},
+        ]
+        mixins_list = [m.strip() for m in (args.with_mixins or "fibery/rank-mixin").split(",") if m.strip()]
+        if mixins_list:
+            commands.append({"command": "fibery.app/install-mixins", "args": {
+                "types": {full_name: mixins_list}
+            }})
+        result = post_command(ctx, "fibery.schema/batch", {"commands": commands})
+        emit({"created": full_name, "mixins": mixins_list, "result": result}, args.output)
+        return
+
+    if op == "create-field":
+        meta = json.loads(args.meta) if args.meta else {}
+        field_type = args.field_type
+
+        # Shorthand: --ui-type email/phone/url sets fibery/text + ui/type meta
+        if args.ui_type:
+            if args.ui_type in ("email", "phone", "url"):
+                field_type = "fibery/text"
+                meta["ui/type"] = args.ui_type
+            elif args.ui_type == "people":
+                field_type = "fibery/user"
+                meta.setdefault("fibery/collection?", True)
+            else:
+                print(f"[fibery] ERROR: unknown --ui-type '{args.ui_type}' (email, phone, url, people)", file=sys.stderr)
+                sys.exit(EXIT_USER_ERROR)
+
+        # Money formatting shorthand
+        if args.money:
+            meta["ui/number-format"] = "Money"
+            meta["ui/number-currency-code"] = args.currency or "USD"
+            meta["ui/number-precision"] = 2
+            meta["ui/number-thousand-separator?"] = True
+
+        if args.percent:
+            meta["ui/number-format"] = "Percent"
+            meta["ui/number-precision"] = args.precision if args.precision is not None else 1
+
+        if args.precision is not None and "ui/number-precision" not in meta:
+            meta["ui/number-precision"] = args.precision
+
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": args.type,
+                "fibery/name": args.name,
+                "fibery/type": field_type,
+                "fibery/meta": meta,
+            }},
+        ]})
+        emit({"created": args.name, "holder": args.type, "type": field_type, "meta": meta, "result": result}, args.output)
+        return
+
+    if op == "create-relation":
+        import uuid as _uuid
+        relation_uuid = str(_uuid.uuid4())
+        cardinality = args.cardinality
+        from_collection = cardinality in ("many-to-many", "one-to-many")
+        to_collection = cardinality in ("many-to-many", "many-to-one")
+        commands = [
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": args.from_type,
+                "fibery/name": args.name_forward,
+                "fibery/type": args.to_type,
+                "fibery/meta": {
+                    "fibery/relation": relation_uuid,
+                    "fibery/collection?": from_collection,
+                },
+            }},
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": args.to_type,
+                "fibery/name": args.name_back,
+                "fibery/type": args.from_type,
+                "fibery/meta": {
+                    "fibery/relation": relation_uuid,
+                    "fibery/collection?": to_collection,
+                },
+            }},
+        ]
+        result = post_command(ctx, "fibery.schema/batch", {"commands": commands})
+        emit({
+            "relation": relation_uuid,
+            "cardinality": cardinality,
+            "from": f"{args.from_type}.{args.name_forward}",
+            "to": f"{args.to_type}.{args.name_back}",
+            "result": result,
+        }, args.output)
+        return
+
+    if op == "rename-type":
+        # NOTE: schema.type/rename uses plain keys (no fibery/ prefix)
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.type/rename", "args": {
+                "from-name": args.old,
+                "to-name": args.new,
+            }},
+        ]})
+        emit({"renamed": args.old, "to": args.new, "result": result}, args.output)
+        return
+
+    if op == "rename-field":
+        # NOTE: schema.field/rename uses plain keys (no fibery/ prefix)
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/rename", "args": {
+                "holder-type": args.type,
+                "from-name": args.old,
+                "to-name": args.new,
+            }},
+        ]})
+        emit({"renamed": args.old, "to": args.new, "holder": args.type, "result": result}, args.output)
+        return
+
+    if op == "delete-type":
+        if not args.yes:
+            print("[fibery] ERROR: delete-type requires --yes", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.type/delete", "args": {
+                "name": args.type,
+                "delete-entities?": bool(args.delete_entities),
+                "delete-related-fields?": True,
+            }},
+        ]})
+        emit({"deleted": args.type, "result": result}, args.output)
+        return
+
+    if op == "delete-field":
+        if not args.yes:
+            print("[fibery] ERROR: delete-field requires --yes", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/delete", "args": {
+                "holder-type": args.type,
+                "name": args.name,
+                "delete-values?": bool(args.delete_values),
+            }},
+        ]})
+        emit({"deleted": args.name, "holder": args.type, "result": result}, args.output)
+        return
+
+    if op == "set-field-meta":
+        # NOTE: schema.field/set-meta takes ONE key/value per call. We expand a
+        # --meta JSON object into one command per entry inside a single batch.
+        meta = json.loads(args.meta)
+        if not isinstance(meta, dict):
+            print("[fibery] ERROR: --meta must be a JSON object", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        commands = [
+            {"command": "schema.field/set-meta", "args": {
+                "holder-type": args.type,
+                "name": args.name,
+                "key": k,
+                "value": v,
+            }}
+            for k, v in meta.items()
+        ]
+        result = post_command(ctx, "fibery.schema/batch", {"commands": commands})
+        emit({"updated": args.name, "holder": args.type, "meta": meta, "result": result}, args.output)
+        return
+
+    if op == "install-mixins":
+        mixins_list = [m.strip() for m in args.mixins.split(",") if m.strip()]
+        result = post_command(ctx, "fibery.app/install-mixins", {
+            "types": {args.type: mixins_list}
+        })
+        emit({"installed": mixins_list, "holder": args.type, "result": result}, args.output)
+        return
+
+    if op == "batch":
+        with open(args.file) as f:
+            commands = json.load(f)
+        if not isinstance(commands, list):
+            print("[fibery] ERROR: batch file must be a JSON array of commands", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        result = post_command(ctx, "fibery.schema/batch", {"commands": commands})
+        emit(result, args.output)
+        return
+
+    if op == "diff":
+        with open(args.file) as f:
+            target = json.load(f)
+        live = post_command(ctx, "fibery.schema/query", {"with-description?": False})
+        diff = _schema_diff(live, target)
+        emit(diff, args.output)
+        return
+
+    if op == "create-enum":
+        import uuid as _uuid
+        # Enum type naming: Space/FieldName_Space/HolderType
+        enum_type_name = f"{args.name}_{args.type}"
+        relation_uuid = str(_uuid.uuid4())
+        is_multi = args.multi
+
+        schema_cmds = [
+            {"command": "schema.enum/create", "args": {
+                "fibery/name": enum_type_name,
+                "fibery/meta": {"fibery/type-component?": True},
+            }},
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": args.type,
+                "fibery/name": args.name,
+                "fibery/type": enum_type_name,
+                "fibery/meta": {
+                    "fibery/collection?": is_multi,
+                    "fibery/type-component?": True,
+                    "fibery/relation": relation_uuid,
+                },
+            }},
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": enum_type_name,
+                "fibery/name": f"{args.name.rsplit('/', 1)[0]}/entities",
+                "fibery/type": args.type,
+                "fibery/meta": {
+                    "fibery/collection?": True,
+                    "fibery/relation": relation_uuid,
+                },
+            }},
+        ]
+
+        batch_cmds: list[dict[str, Any]] = [
+            {"command": "fibery.schema/batch", "args": {"commands": schema_cmds}},
+        ]
+
+        if args.options:
+            option_names = [o.strip() for o in args.options.split(",") if o.strip()]
+            batch_cmds.append({
+                "command": "fibery.entity.batch/create",
+                "args": {
+                    "type": enum_type_name,
+                    "entities": [
+                        {"enum/name": name, "fibery/rank": i * 1000000, "enum/color": None, "enum/icon": None}
+                        for i, name in enumerate(option_names)
+                    ],
+                },
+            })
+
+        result = post_command(ctx, "fibery.command/batch", {"commands": batch_cmds})
+        emit({
+            "created": args.name,
+            "enum_type": enum_type_name,
+            "multi_select": is_multi,
+            "options": args.options,
+            "result": result,
+        }, args.output)
+        return
+
+    if op == "create-rich-text":
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": args.type,
+                "fibery/name": args.name,
+                "fibery/type": "Collaboration~Documents/Document",
+                "fibery/meta": {
+                    "fibery/entity-component?": True,
+                    "ui/object-editor-order": -1,
+                },
+            }},
+        ]})
+        emit({"created": args.name, "holder": args.type, "result": result}, args.output)
+        return
+
+    if op == "create-files":
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": args.type,
+                "fibery/name": args.name,
+                "fibery/type": "fibery/file",
+                "fibery/meta": {
+                    "fibery/collection?": True,
+                    "fibery/entity-component?": True,
+                },
+            }},
+        ]})
+        emit({"created": args.name, "holder": args.type, "type": "fibery/file", "result": result}, args.output)
+        return
+
+    if op == "delete-field-meta":
+        result = post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/delete-meta", "args": {
+                "holder-type": args.type,
+                "name": args.name,
+                "key": args.key,
+            }},
+        ]})
+        emit({"deleted_key": args.key, "field": args.name, "holder": args.type, "result": result}, args.output)
+        return
+
+    if op == "reorder-fields":
+        fields = [f.strip() for f in args.fields.split(",") if f.strip()]
+        commands = [
+            {"command": "schema.field/set-meta", "args": {
+                "holder-type": args.type,
+                "name": field,
+                "key": "ui/object-editor-order",
+                "value": i,
+            }}
+            for i, field in enumerate(fields)
+        ]
+        result = post_command(ctx, "fibery.schema/batch", {"commands": commands})
+        emit({
+            "reordered": len(fields),
+            "holder": args.type,
+            "order": [{"position": i, "field": f} for i, f in enumerate(fields)],
+            "result": result,
+        }, args.output)
+        return
+
+    if op == "convert-field":
+        if not args.yes:
+            print("[fibery] ERROR: convert-field requires --yes (data in this field will be lost)", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        # Step 1: delete old field
+        post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/delete", "args": {
+                "holder-type": args.type,
+                "name": args.name,
+                "delete-values?": True,
+            }},
+        ]})
+        # Step 2: create with new type
+        meta = json.loads(args.meta) if args.meta else {}
+        post_command(ctx, "fibery.schema/batch", {"commands": [
+            {"command": "schema.field/create", "args": {
+                "fibery/holder-type": args.type,
+                "fibery/name": args.name,
+                "fibery/type": args.new_type,
+                "fibery/meta": meta,
+            }},
+        ]})
+        emit({"converted": args.name, "holder": args.type, "new_type": args.new_type, "data_lost": True}, args.output)
+        return
+
+    if op == "create-workflow":
+        import uuid as _uuid
+        state_types = {"Not started": [], "Started": [], "Finished": []}
+        for s in args.states.split("|"):
+            s = s.strip()
+            if ":" in s:
+                name, category = s.rsplit(":", 1)
+                category = category.strip()
+            else:
+                name = s
+                category = "Not started"
+            valid = {"not started": "Not started", "started": "Started", "finished": "Finished",
+                     "not_started": "Not started", "todo": "Not started", "done": "Finished",
+                     "in_progress": "Started", "cancelled": "Finished"}
+            category = valid.get(category.lower(), category)
+            state_types.setdefault(category, [])
+            state_types[category].append(name.strip())
+
+        states = []
+        for cat in ["Not started", "Started", "Finished"]:
+            for name in state_types.get(cat, []):
+                states.append({
+                    "fibery/id": str(_uuid.uuid4()),
+                    "enum/name": name,
+                    "enum/color": None,
+                    "enum/icon": None,
+                    "workflow/Type": cat,
+                })
+
+        if not states:
+            print("[fibery] ERROR: --states required (e.g. 'To Do:todo|In Progress:started|Done:done')", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+
+        default_id = states[0]["fibery/id"]
+        result = post_command(ctx, "workflow/install", {
+            "type": args.type,
+            "states": states,
+            "default-state-id": default_id,
+        })
+        emit({
+            "installed": "workflow",
+            "holder": args.type,
+            "states": [{"name": s["enum/name"], "category": s["workflow/Type"]} for s in states],
+            "default": states[0]["enum/name"],
+            "result": result,
+        }, args.output)
+        return
+
+    if op == "create-formula":
+        body = json.loads(args.body) if args.body else {}
+        if args.body_file:
+            with open(args.body_file) as f:
+                body = json.load(f)
+        if not body:
+            print("[fibery] ERROR: create-formula needs --body or --body-file with field-creator payload", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        r = ctx.client.post(
+            ctx.url("/api/field-creator/field"),
+            headers=ctx.headers(),
+            json={"fieldObject": body},
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+        return
+
+    print(f"[fibery] ERROR: unknown schema op '{op}'", file=sys.stderr)
+    sys.exit(EXIT_USER_ERROR)
+
+
+def _schema_diff(live: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    """Compare live schema to target schema by type name. Types only for MVP."""
+    def type_map(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {t.get("fibery/name"): t for t in schema.get("fibery/types", [])}
+
+    live_types = type_map(live)
+    target_types = type_map(target)
+
+    only_live = sorted(set(live_types) - set(target_types))
+    only_target = sorted(set(target_types) - set(live_types))
+    shared = sorted(set(live_types) & set(target_types))
+
+    field_diffs = {}
+    for name in shared:
+        lf = {f.get("fibery/name") for f in live_types[name].get("fibery/fields", [])}
+        tf = {f.get("fibery/name") for f in target_types[name].get("fibery/fields", [])}
+        added = sorted(tf - lf)
+        removed = sorted(lf - tf)
+        if added or removed:
+            field_diffs[name] = {"added": added, "removed": removed}
+
+    return {
+        "types_only_live": only_live,
+        "types_only_target": only_target,
+        "field_diffs": field_diffs,
+    }
+
+
+def cmd_file(ctx: Ctx, args: argparse.Namespace) -> None:
+    """File download, upload, or sign-url operations."""
+    if args.file_op == "download":
+        r = ctx.client.get(ctx.url(f"/api/files/{args.secret}"), headers=ctx.headers(), timeout=60.0, follow_redirects=True)
+        if not r.is_success:
+            http_error(r)
+        if args.out:
+            with open(args.out, "wb") as f:
+                f.write(r.content)
+            emit({"saved": args.out, "bytes": len(r.content), "content_type": r.headers.get("content-type")}, args.output)
+        else:
+            sys.stdout.buffer.write(r.content)
+    elif args.file_op == "upload":
+        with open(args.path, "rb") as f:
+            files = {"file": (args.path.split("/")[-1], f)}
+            headers = {"Authorization": f"Token {ctx.token}"}
+            r = ctx.client.post(ctx.url("/api/files"), headers=headers, files=files, timeout=120.0)
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+    elif args.file_op == "sign":
+        r = ctx.client.post(
+            ctx.url("/api/files/sign-urls"),
+            headers=ctx.headers(),
+            json={"files": [args.secret]},
+            timeout=30.0,
+        )
+        if not r.is_success:
+            http_error(r)
+        emit(r.json(), args.output)
+
+    elif args.file_op == "upload-multi":
+        import time as _time
+        paths = [p.strip() for p in args.paths.split(",") if p.strip()]
+        results = []
+        for path in paths:
+            with open(path, "rb") as f:
+                files_payload = {"file": (path.split("/")[-1], f)}
+                headers = {"Authorization": f"Token {ctx.token}"}
+                r = ctx.client.post(ctx.url("/api/files"), headers=headers, files=files_payload, timeout=120.0)
+            if not r.is_success:
+                results.append({"path": path, "error": f"HTTP {r.status_code}"})
+            else:
+                results.append(r.json())
+            if len(paths) > 1:
+                _time.sleep(0.35)
+        emit(results, args.output)
+
+    elif args.file_op == "attach":
+        import time as _time
+        paths = [p.strip() for p in args.paths.split(",") if p.strip()]
+        uploaded = []
+        for path in paths:
+            with open(path, "rb") as f:
+                files_payload = {"file": (path.split("/")[-1], f)}
+                headers = {"Authorization": f"Token {ctx.token}"}
+                r = ctx.client.post(ctx.url("/api/files"), headers=headers, files=files_payload, timeout=120.0)
+            if not r.is_success:
+                print(f"[fibery] ERROR: upload failed for {path}: HTTP {r.status_code}", file=sys.stderr)
+                continue
+            uploaded.append(r.json())
+            _time.sleep(0.35)
+        if not uploaded:
+            print("[fibery] ERROR: no files uploaded successfully", file=sys.stderr)
+            sys.exit(EXIT_API_ERROR)
+        items = [{"fibery/id": u["fibery/id"]} for u in uploaded]
+        post_command(ctx, "fibery.entity/add-collection-items", {
+            "type": args.type,
+            "entity": {"fibery/id": args.entity_id},
+            "field": args.field,
+            "items": items,
+        })
+        emit({
+            "attached": len(uploaded),
+            "entity": args.entity_id,
+            "field": args.field,
+            "files": [{"name": u.get("fibery/name"), "id": u.get("fibery/id"), "secret": u.get("fibery/secret")} for u in uploaded],
+        }, args.output)
+
+    elif args.file_op == "list-on":
+        result = post_command(ctx, "fibery.entity/query", {
+            "query": {
+                "q/from": args.type,
+                "q/select": {
+                    "fibery/id": ["fibery/id"],
+                    "files": {
+                        "q/from": [args.field],
+                        "q/select": {
+                            "fibery/id": ["fibery/id"],
+                            "name": ["fibery/name"],
+                            "secret": ["fibery/secret"],
+                            "content-type": ["fibery/content-type"],
+                            "size": ["fibery/content-length"],
+                        },
+                        "q/limit": "q/no-limit",
+                    },
+                },
+                "q/where": ["=", ["fibery/id"], "$eid"],
+                "q/limit": 1,
+            },
+            "params": {"$eid": args.entity_id},
+        })
+        files = result[0].get("files", []) if result else []
+        emit(files, args.output)
+
+    elif args.file_op == "download-all":
+        from pathlib import Path
+        import time as _time
+        result = post_command(ctx, "fibery.entity/query", {
+            "query": {
+                "q/from": args.type,
+                "q/select": {
+                    "files": {
+                        "q/from": [args.field],
+                        "q/select": {
+                            "name": ["fibery/name"],
+                            "secret": ["fibery/secret"],
+                        },
+                        "q/limit": "q/no-limit",
+                    },
+                },
+                "q/where": ["=", ["fibery/id"], "$eid"],
+                "q/limit": 1,
+            },
+            "params": {"$eid": args.entity_id},
+        })
+        files = result[0].get("files", []) if result else []
+        if not files:
+            emit({"downloaded": 0, "message": "no files"}, args.output)
+            return
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        downloaded = []
+        for fi in files:
+            secret = fi.get("secret")
+            name = fi.get("name", secret)
+            r = ctx.client.get(ctx.url(f"/api/files/{secret}"), headers=ctx.headers(), timeout=60.0, follow_redirects=True)
+            if r.is_success:
+                out_path = out_dir / name
+                with open(out_path, "wb") as f:
+                    f.write(r.content)
+                downloaded.append({"name": name, "bytes": len(r.content), "path": str(out_path)})
+            _time.sleep(0.35)
+        emit({"downloaded": len(downloaded), "files": downloaded}, args.output)
+
+
+# ---------- Argparse ----------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fibery",
+        description="CLI for Fibery workspaces",
+    )
+    parser.add_argument("workspace", help="Workspace alias from config, e.g. 'myworkspace'")
+    parser.add_argument(
+        "--workspace-host",
+        help="Direct workspace host, e.g. myworkspace.fibery.io",
+    )
+    parser.add_argument(
+        "--token",
+        help="Direct API token. Overrides FIBERY_TOKEN and Keychain lookup.",
+    )
+    parser.add_argument("-o", "--output", choices=["json", "raw", "table"], default="json",
+                        help="Output format (default: json)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("date", help="Current date and workspace info")
+
+    p_dbs = sub.add_parser("dbs", help="List databases in the workspace")
+    p_dbs.add_argument("--all", action="store_true", help="Include system/enum types (default: domain types only)")
+
+    p_describe = sub.add_parser("describe", help="Describe fields and meta for one database")
+    p_describe.add_argument("type", help="Database name, e.g. 'Task Management/Task'")
+
+    p_query = sub.add_parser("query", help="Query entities from a database")
+    p_query.add_argument("type", help="Database name, e.g. 'Task Management/Task'")
+    p_query.add_argument("--where", action="append", default=[],
+                         help="Filter clause: Field=value, Field!=value, Field>value, Field<value. Repeatable (ANDed).")
+    p_query.add_argument("--select", default=None,
+                         help="Comma-separated field paths. Use dots for nested: 'Name,State.enum/name'")
+    p_query.add_argument("--limit", type=int, default=50)
+    p_query.add_argument("--offset", type=int, default=0)
+    p_query.add_argument("--order-by", default=None, help="Field name to order by")
+    p_query.add_argument("--order-desc", action="store_true", help="Order descending (default: ascending)")
+    p_query.add_argument("--json-query", default=None,
+                         help="Raw q/ DSL as JSON. Bypasses --where/--select/--limit.")
+    p_query.add_argument("--params", default=None,
+                         help="Query parameters as JSON object (used with --json-query)")
+
+    p_create = sub.add_parser("create", help="Create an entity in a database")
+    p_create.add_argument("type", help="Database name")
+    p_create.add_argument("--fields", default=None, help="Entity fields as JSON object")
+    p_create.add_argument("--fields-file", default=None, help="Path to JSON file with entity fields")
+
+    p_update = sub.add_parser("update", help="Update an entity by ID")
+    p_update.add_argument("id", help="Entity fibery/id (UUID)")
+    p_update.add_argument("--type", required=True, help="Database name (required)")
+    p_update.add_argument("--fields", default=None, help="Fields to update as JSON object")
+    p_update.add_argument("--fields-file", default=None, help="Path to JSON file with fields")
+
+    p_batch = sub.add_parser("batch-create", help="Create many entities from a JSON array file")
+    p_batch.add_argument("type", help="Database name")
+    p_batch.add_argument("--file", required=True, help="Path to JSON array of entities")
+
+    p_delete = sub.add_parser("delete", help="Delete an entity by ID (destructive)")
+    p_delete.add_argument("id", help="Entity fibery/id")
+    p_delete.add_argument("--type", required=True, help="Database name")
+    p_delete.add_argument("--yes", action="store_true", help="Confirm destructive operation")
+
+    p_bdel = sub.add_parser("batch-delete", help="Delete many entities by ID (destructive)")
+    p_bdel.add_argument("--type", required=True, help="Database name")
+    p_bdel.add_argument("--ids", required=True, help="Comma-separated entity UUIDs")
+    p_bdel.add_argument("--yes", action="store_true", help="Confirm destructive")
+
+    p_link = sub.add_parser("link", help="Add items to a collection/relation field")
+    p_link.add_argument("id", help="Parent entity fibery/id")
+    p_link.add_argument("--type", required=True, help="Parent database name")
+    p_link.add_argument("--field", required=True, help="Collection field name")
+    p_link_items = p_link.add_mutually_exclusive_group(required=True)
+    p_link_items.add_argument("--items", default=None, help="Comma-separated target entity UUIDs")
+    p_link_items.add_argument("--by-name", default=None, help="Comma-separated target names (resolved via schema)")
+
+    p_unlink = sub.add_parser("unlink", help="Remove items from a collection/relation field")
+    p_unlink.add_argument("id", help="Parent entity fibery/id")
+    p_unlink.add_argument("--type", required=True, help="Parent database name")
+    p_unlink.add_argument("--field", required=True, help="Collection field name")
+    p_unlink_items = p_unlink.add_mutually_exclusive_group(required=True)
+    p_unlink_items.add_argument("--items", default=None, help="Comma-separated target entity UUIDs")
+    p_unlink_items.add_argument("--by-name", default=None, help="Comma-separated target names")
+
+    # Space management
+    p_space = sub.add_parser("space", help="Manage spaces (create, list, delete)")
+    space_sub = p_space.add_subparsers(dest="space_op", required=True)
+    sp_list = space_sub.add_parser("list", help="List all spaces")
+    sp_list.add_argument("--all", action="store_true", help="Include system spaces")
+    sp_create = space_sub.add_parser("create", help="Create a new space")
+    sp_create.add_argument("name", help="Space name")
+    sp_create.add_argument("--color", default=None, help="Hex color, default #F7D130")
+    sp_create.add_argument("--icon", default=None, help="Icon name, default puzzle-piece")
+    sp_create.add_argument("--description", default=None, help="Space description")
+    sp_delete = space_sub.add_parser("delete", help="Delete a space and all its types (destructive)")
+    sp_delete.add_argument("name", help="Space name")
+    sp_delete.add_argument("--yes", action="store_true", help="Confirm destructive")
+    sp_update = space_sub.add_parser("update", help="Update space properties (color, icon)")
+    sp_update.add_argument("name", help="Space name")
+    sp_update.add_argument("--color", default=None, help="Hex color")
+    sp_update.add_argument("--icon", default=None, help="Icon name")
+
+    # Event sequence
+    sub.add_parser("event-seq", help="Get current event sequence ID for sync")
+
+    p_dbatch = sub.add_parser("docs-batch", help="Fetch multiple documents by secret (NDJSON output)")
+    p_dbatch.add_argument("--secrets", default=None, help="Comma-separated doc secrets")
+    p_dbatch.add_argument("--secrets-file", default=None, help="File with one secret per line")
+    p_dbatch.add_argument("--format", choices=["md", "html", "json"], default="md")
+
+    p_dsync = sub.add_parser("docs-sync", help="Incremental doc sync to local cache")
+    p_dsync.add_argument("--type", required=True, help="Database name (e.g. 'Task Management/Task')")
+    p_dsync.add_argument("--field", required=True, help="Rich-text field name (e.g. 'Task Management/Description')")
+    p_dsync.add_argument("--cache-dir", required=True, help="Local directory for cached docs")
+    p_dsync.add_argument("--limit", type=int, default=200, help="Max entities per sync run (default 200)")
+    p_dsync.add_argument("--format", choices=["md", "html", "json"], default="md")
+    p_dsync.add_argument("--full", action="store_true", help="Full re-sync (ignore last-run timestamp)")
+
+    # Automation management
+    p_auto = sub.add_parser("automation", help="Manage automations (REST API)")
+    auto_sub = p_auto.add_subparsers(dest="auto_op", required=True)
+    auto_list = auto_sub.add_parser("list", help="List automation rules for a type")
+    auto_list.add_argument("--type-id", required=True, help="Type UUID (not name)")
+    auto_triggers = auto_sub.add_parser("triggers", help="List available triggers for a type")
+    auto_triggers.add_argument("--type-id", required=True, help="Type UUID")
+    auto_actions = auto_sub.add_parser("actions", help="List available actions for a type")
+    auto_actions.add_argument("--type-id", required=True, help="Type UUID")
+    auto_create = auto_sub.add_parser("create", help="Create an automation rule")
+    auto_create.add_argument("--type-id", required=True, help="Type UUID")
+    auto_create.add_argument("--body", default=None, help="Rule JSON")
+    auto_create.add_argument("--body-file", default=None, help="Path to rule JSON file")
+    auto_get = auto_sub.add_parser("get", help="Get a single automation rule")
+    auto_get.add_argument("rule_id", help="Rule ID")
+
+    # View management
+    p_view = sub.add_parser("view", help="Manage views (list, create)")
+    view_sub = p_view.add_subparsers(dest="view_op", required=True)
+    v_list = view_sub.add_parser("list", help="List views")
+    v_list.add_argument("--space-id", default=None, help="Filter by space/app UUID")
+    v_create = view_sub.add_parser("create", help="Create a view")
+    v_create.add_argument("--body", default=None, help="View definition as JSON")
+    v_create.add_argument("--body-file", default=None, help="Path to view definition JSON file")
+
+    v_rename = view_sub.add_parser("rename", help="Rename a view")
+    v_rename.add_argument("id", help="View UUID")
+    v_rename.add_argument("--name", required=True, help="New name")
+
+    v_delete = view_sub.add_parser("delete", help="Delete views (destructive)")
+    v_delete.add_argument("--ids", required=True, help="Comma-separated view UUIDs")
+    v_delete.add_argument("--yes", action="store_true", help="Confirm destructive")
+
+    v_move = view_sub.add_parser("move-to-folder", help="Move a view into a folder")
+    v_move.add_argument("id", help="View UUID")
+    v_move.add_argument("--folder-id", required=True, help="Target folder UUID (or null to ungroup)")
+
+    v_cf = view_sub.add_parser("create-folder", help="Create a folder for organizing views")
+    v_cf.add_argument("--space-id", required=True, help="Space/app UUID")
+    v_cf.add_argument("--name", required=True, help="Folder name")
+
+    v_rf = view_sub.add_parser("rename-folder", help="Rename a folder")
+    v_rf.add_argument("id", help="Folder UUID")
+    v_rf.add_argument("--name", required=True, help="New name")
+
+    v_lf = view_sub.add_parser("list-folders", help="List all folders")
+
+    v_sf = view_sub.add_parser("create-smart-folder", help="Create a smart folder")
+    v_sf.add_argument("--space-id", required=True, help="Space/app UUID")
+    v_sf.add_argument("--name", required=True, help="Smart folder name")
+
+    # Button management
+    p_button = sub.add_parser("button", help="Manage automation buttons")
+    button_sub = p_button.add_subparsers(dest="button_op", required=True)
+    btn_list = button_sub.add_parser("list", help="List buttons for a type")
+    btn_list.add_argument("--type-id", required=True, help="Type UUID")
+    btn_actions = button_sub.add_parser("actions", help="List available button actions")
+    btn_actions.add_argument("--type-id", required=True, help="Type UUID")
+    btn_create = button_sub.add_parser("create", help="Create a button")
+    btn_create.add_argument("--type-id", required=True, help="Type UUID")
+    btn_create.add_argument("--body", default=None, help="Button definition as JSON")
+    btn_create.add_argument("--body-file", default=None, help="Path to button JSON file")
+
+    # Tier 2: advanced read + doc write
+    p_doc = sub.add_parser("doc", help="Fetch rich-text document content by secret")
+    p_doc.add_argument("secret", help="Document secret (UUID from a rich-text field)")
+    p_doc.add_argument("--format", choices=["md", "html", "json"], default="md")
+    p_doc.add_argument("--raw-content", action="store_true",
+                       help="Print raw content (not wrapped in JSON envelope)")
+
+    p_doc_write = sub.add_parser("doc-write", help="Write rich-text document content (PUT)")
+    p_doc_write.add_argument("secret", help="Document secret")
+    p_doc_write.add_argument("--content", default=None, help="Content string")
+    p_doc_write.add_argument("--content-file", default=None, help="Path to content file")
+    p_doc_write.add_argument("--format", choices=["md", "html", "json"], default="md")
+
+    p_comments = sub.add_parser("comments", help="Fetch threaded comments on an entity")
+    p_comments.add_argument("id", help="Parent entity fibery/id")
+    p_comments.add_argument("--type", required=True, help="Parent database name")
+    p_comments.add_argument("--with-content", action="store_true",
+                            help="Also fetch each comment's document body")
+    p_comments.add_argument("--format", choices=["md", "html", "json"], default="md",
+                            help="Format for --with-content (default: md)")
+
+    p_comment_add = sub.add_parser("comment-add", help="Add a comment to an entity")
+    p_comment_add.add_argument("id", help="Parent entity fibery/id")
+    p_comment_add.add_argument("--type", required=True, help="Parent database name")
+    p_comment_add.add_argument("--content", default=None, help="Comment text (markdown)")
+    p_comment_add.add_argument("--content-file", default=None, help="Path to comment content file")
+
+    p_graphql = sub.add_parser("graphql", help="Execute a GraphQL query against a space")
+    p_graphql.add_argument("space", help="Space name, e.g. 'Task Management'")
+    p_graphql.add_argument("--query", required=True, help="GraphQL query string")
+    p_graphql.add_argument("--variables", default=None, help="GraphQL variables as JSON object")
+
+    p_webhook = sub.add_parser("webhook", help="Manage webhooks")
+    webhook_sub = p_webhook.add_subparsers(dest="webhook_op", required=True)
+    webhook_sub.add_parser("list", help="List webhooks")
+    wh_create = webhook_sub.add_parser("create", help="Create a webhook")
+    wh_create.add_argument("--body", default=None, help="Webhook body as JSON")
+    wh_create.add_argument("--body-file", default=None, help="Path to JSON file")
+    wh_delete = webhook_sub.add_parser("delete", help="Delete a webhook by ID")
+    wh_delete.add_argument("webhook_id", help="Webhook ID")
+    wh_delete.add_argument("--yes", action="store_true", help="Confirm destructive")
+
+    # Tier 3: schema manipulation
+    p_schema = sub.add_parser("schema", help="Schema manipulation (sandbox spaces only recommended)")
+    schema_sub = p_schema.add_subparsers(dest="schema_op", required=True)
+
+    schema_sub.add_parser("dump", help="Dump full workspace schema as JSON")
+
+    sc_ct = schema_sub.add_parser("create-type", help="Create a new database (type)")
+    sc_ct.add_argument("--space", required=True, help="Space name (must already exist)")
+    sc_ct.add_argument("--name", required=True, help="Type name (without space prefix)")
+    sc_ct.add_argument("--color", default=None, help="Hex color, default #F7D130")
+    sc_ct.add_argument("--with-mixins", default="fibery/rank-mixin",
+                       help="Comma-list of mixins to install (default: fibery/rank-mixin)")
+
+    sc_cf = schema_sub.add_parser("create-field", help="Create a field on an existing type")
+    sc_cf.add_argument("--type", required=True, help="Holder type (e.g. 'Sandbox/MyType')")
+    sc_cf.add_argument("--name", required=True, help="Full field name (with space prefix)")
+    sc_cf.add_argument("--field-type", required=True, help="e.g. fibery/text, fibery/int, fibery/bool")
+    sc_cf.add_argument("--meta", default=None, help="Extra meta JSON")
+    sc_cf.add_argument("--ui-type", default=None, choices=["email", "phone", "url", "people"],
+                       help="Shorthand: creates fibery/text with ui/type meta (or fibery/user for people)")
+    sc_cf.add_argument("--money", action="store_true", help="Format as money (USD by default)")
+    sc_cf.add_argument("--currency", default=None, help="Currency code for --money (default: USD)")
+    sc_cf.add_argument("--percent", action="store_true", help="Format as percentage")
+    sc_cf.add_argument("--precision", type=int, default=None, help="Decimal precision for number fields")
+
+    sc_cr = schema_sub.add_parser("create-relation", help="Create a bidirectional relation")
+    sc_cr.add_argument("--from-type", required=True, help="Source type name")
+    sc_cr.add_argument("--to-type", required=True, help="Target type name")
+    sc_cr.add_argument("--name-forward", required=True, help="Field name on source side")
+    sc_cr.add_argument("--name-back", required=True, help="Field name on target side")
+    sc_cr.add_argument("--cardinality", choices=["many-to-many", "one-to-many", "many-to-one", "one-to-one"],
+                       default="many-to-many")
+
+    sc_rt = schema_sub.add_parser("rename-type", help="Rename a type")
+    sc_rt.add_argument("old")
+    sc_rt.add_argument("new")
+
+    sc_rf = schema_sub.add_parser("rename-field", help="Rename a field on a type")
+    sc_rf.add_argument("--type", required=True)
+    sc_rf.add_argument("old")
+    sc_rf.add_argument("new")
+
+    sc_dt = schema_sub.add_parser("delete-type", help="Delete a type (destructive)")
+    sc_dt.add_argument("type")
+    sc_dt.add_argument("--delete-entities", action="store_true", help="Also delete all entities")
+    sc_dt.add_argument("--yes", action="store_true", help="Confirm destructive")
+
+    sc_df = schema_sub.add_parser("delete-field", help="Delete a field (destructive)")
+    sc_df.add_argument("--type", required=True)
+    sc_df.add_argument("--name", required=True)
+    sc_df.add_argument("--delete-values", action="store_true")
+    sc_df.add_argument("--yes", action="store_true")
+
+    sc_sfm = schema_sub.add_parser("set-field-meta", help="Update field metadata")
+    sc_sfm.add_argument("--type", required=True)
+    sc_sfm.add_argument("--name", required=True)
+    sc_sfm.add_argument("--meta", required=True, help="Meta as JSON")
+
+    sc_im = schema_sub.add_parser("install-mixins", help="Install mixins on a type")
+    sc_im.add_argument("--type", required=True)
+    sc_im.add_argument("--mixins", required=True, help="Comma-separated mixin names")
+
+    sc_batch = schema_sub.add_parser("batch", help="Apply a JSON array of schema commands atomically")
+    sc_batch.add_argument("--file", required=True)
+
+    sc_diff = schema_sub.add_parser("diff", help="Diff live schema against a target JSON file")
+    sc_diff.add_argument("--file", required=True)
+
+    sc_enum = schema_sub.add_parser("create-enum", help="Create a single/multi-select enum field with options")
+    sc_enum.add_argument("--type", required=True, help="Holder type (e.g. 'Sandbox/MyType')")
+    sc_enum.add_argument("--name", required=True, help="Field name with space prefix (e.g. 'Sandbox/Status')")
+    sc_enum.add_argument("--options", default=None, help="Comma-separated option names (e.g. 'Open,In Progress,Done')")
+    sc_enum.add_argument("--multi", action="store_true", help="Multi-select (default: single-select)")
+
+    sc_rt = schema_sub.add_parser("create-rich-text", help="Create a rich-text (document) field")
+    sc_rt.add_argument("--type", required=True, help="Holder type")
+    sc_rt.add_argument("--name", required=True, help="Field name with space prefix")
+
+    sc_files = schema_sub.add_parser("create-files", help="Create a file attachment collection field")
+    sc_files.add_argument("--type", required=True, help="Holder type")
+    sc_files.add_argument("--name", required=True, help="Field name with space prefix")
+
+    sc_dfm = schema_sub.add_parser("delete-field-meta", help="Remove a specific meta key from a field")
+    sc_dfm.add_argument("--type", required=True, help="Holder type")
+    sc_dfm.add_argument("--name", required=True, help="Field name")
+    sc_dfm.add_argument("--key", required=True, help="Meta key to remove (e.g. 'fibery/readonly?')")
+
+    sc_conv = schema_sub.add_parser("convert-field", help="Change a field's type (destructive: deletes all values)")
+    sc_conv.add_argument("--type", required=True, help="Holder type")
+    sc_conv.add_argument("--name", required=True, help="Field name to convert")
+    sc_conv.add_argument("--new-type", required=True, help="New field type (e.g. fibery/int, fibery/text)")
+    sc_conv.add_argument("--meta", default=None, help="Optional meta JSON for the new field")
+    sc_conv.add_argument("--yes", action="store_true", help="Confirm data loss")
+
+    sc_reorder = schema_sub.add_parser("reorder-fields", help="Set field display order in one batch")
+    sc_reorder.add_argument("--type", required=True, help="Database type")
+    sc_reorder.add_argument("--fields", required=True,
+                            help="Comma-separated field names in desired order")
+
+    sc_wf = schema_sub.add_parser("create-workflow", help="Install workflow state machine on a type")
+    sc_wf.add_argument("--type", required=True, help="Database type to add workflow to")
+    sc_wf.add_argument("--states", required=True,
+                       help="Pipe-separated states with optional category: 'To Do:todo|In Progress:started|Done:done|Cancelled:finished'")
+
+    sc_formula = schema_sub.add_parser("create-formula", help="Create a formula/lookup field (via field-creator REST)")
+    sc_formula.add_argument("--body", default=None, help="fieldObject JSON")
+    sc_formula.add_argument("--body-file", default=None, help="Path to fieldObject JSON file")
+
+    p_file = sub.add_parser("file", help="File operations: download, upload, sign")
+    file_sub = p_file.add_subparsers(dest="file_op", required=True)
+    fl_dl = file_sub.add_parser("download", help="Download a file by secret")
+    fl_dl.add_argument("secret", help="File secret")
+    fl_dl.add_argument("--out", default=None, help="Output path (default: stdout)")
+    fl_up = file_sub.add_parser("upload", help="Upload a file")
+    fl_up.add_argument("path", help="Local file path")
+    fl_sign = file_sub.add_parser("sign", help="Get a 60-min signed URL for a file")
+    fl_sign.add_argument("secret", help="File secret")
+
+    fl_multi = file_sub.add_parser("upload-multi", help="Upload multiple files")
+    fl_multi.add_argument("--paths", required=True, help="Comma-separated local file paths")
+
+    fl_attach = file_sub.add_parser("attach", help="Upload files and attach to an entity's file field")
+    fl_attach.add_argument("--paths", required=True, help="Comma-separated local file paths")
+    fl_attach.add_argument("--type", required=True, help="Entity database name")
+    fl_attach.add_argument("--entity-id", required=True, help="Entity fibery/id")
+    fl_attach.add_argument("--field", required=True, help="File collection field name")
+
+    fl_list = file_sub.add_parser("list-on", help="List files attached to an entity")
+    fl_list.add_argument("--type", required=True, help="Entity database name")
+    fl_list.add_argument("--entity-id", required=True, help="Entity fibery/id")
+    fl_list.add_argument("--field", required=True, help="File collection field name")
+
+    fl_dlall = file_sub.add_parser("download-all", help="Download all files from an entity to a directory")
+    fl_dlall.add_argument("--type", required=True, help="Entity database name")
+    fl_dlall.add_argument("--entity-id", required=True, help="Entity fibery/id")
+    fl_dlall.add_argument("--field", required=True, help="File collection field name")
+    fl_dlall.add_argument("--out-dir", required=True, help="Local directory for downloaded files")
+
+    return parser
+
+
+HANDLERS = {
+    "date": cmd_date,
+    "dbs": cmd_dbs,
+    "describe": cmd_describe,
+    "query": cmd_query,
+    "create": cmd_create,
+    "update": cmd_update,
+    "batch-create": cmd_batch_create,
+    "batch-delete": cmd_batch_delete,
+    "delete": cmd_delete,
+    "link": cmd_link,
+    "unlink": cmd_unlink,
+    "space": cmd_space,
+    "event-seq": cmd_event_seq,
+    "docs-batch": cmd_docs_batch,
+    "docs-sync": cmd_docs_sync,
+    "automation": cmd_automation,
+    "doc": cmd_doc,
+    "doc-write": cmd_doc_write,
+    "comments": cmd_comments,
+    "comment-add": cmd_comment_add,
+    "graphql": cmd_graphql,
+    "webhook": cmd_webhook,
+    "file": cmd_file,
+    "schema": cmd_schema,
+    "view": cmd_view,
+    "button": cmd_button,
+}
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    config = load_config()
+    host = resolve_host(args.workspace, workspace_host=args.workspace_host, config=config)
+    token = get_token(host, workspace=args.workspace, token=args.token, config=config)
+
+    with httpx.Client(timeout=30.0) as client:
+        ctx = Ctx(workspace=args.workspace, host=host, token=token, client=client)
+        handler = HANDLERS.get(args.command)
+        if not handler:
+            parser.error(f"Unknown command: {args.command}")
+        handler(ctx, args)
+
+
+if __name__ == "__main__":
+    main()

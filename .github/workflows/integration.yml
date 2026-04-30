@@ -1,0 +1,28 @@
+name: integration
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    if: ${{ secrets.FIBERY_TEST_WORKSPACE != '' && secrets.FIBERY_TEST_WORKSPACE_HOST != '' && secrets.FIBERY_TEST_TOKEN != '' }}
+    runs-on: ubuntu-latest
+    env:
+      FIBERY_TEST_WORKSPACE: ${{ secrets.FIBERY_TEST_WORKSPACE }}
+      FIBERY_TEST_WORKSPACE_HOST: ${{ secrets.FIBERY_TEST_WORKSPACE_HOST }}
+      FIBERY_TEST_TOKEN: ${{ secrets.FIBERY_TEST_TOKEN }}
+      FIBERY_TEST_SANDBOX_SPACE: ${{ secrets.FIBERY_TEST_SANDBOX_SPACE }}
+      FIBERY_TEST_SANDBOX_DB: ${{ secrets.FIBERY_TEST_SANDBOX_DB }}
+      FIBERY_TEST_TASK_TYPE: ${{ secrets.FIBERY_TEST_TASK_TYPE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run --with pytest --with httpx pytest tests/test_integration.py -v
