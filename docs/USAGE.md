@@ -4,6 +4,16 @@
 
 Built from official docs + 15+ undocumented endpoints discovered via Chrome DevTools HAR capture. See `docs/INTERNAL-API.md` for the full internal API reference and `docs/HAR-CLI-BUILDER.md` for the discovery methodology.
 
+## For agent consumers
+
+If you're an AI agent calling `fibery`, read [AGENTS.md](AGENTS.md) first. The short version:
+
+- Pass `-o json` (it's the default for most commands, but pass it explicitly to be safe). Stdout is a single JSON document per invocation; stderr is human diagnostics.
+- Filter reads with `--where '<JSON predicate>'` rather than slicing client-side — Fibery handles the predicate server-side and the result fits in your context.
+- Exit codes follow `sysexits.h`: `0` OK, `2` usage, `3` auth, `4` not found, `75` queued. Don't retry on `3` or `4`.
+- If stderr contains `method not found`, `unknown command`, or `404` on `/api/*`, the capability is missing. Don't fabricate workarounds — escalate via the auto-extension loop in [README.md § Auto-Extension Loop](../README.md#auto-extension-loop).
+- See [CAPABILITIES.md](CAPABILITIES.md) for what's covered today before designing a multi-step flow.
+
 ## Workspace Routing
 
 ```bash
