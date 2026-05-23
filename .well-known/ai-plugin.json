@@ -1,0 +1,17 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "Fibery CLI",
+  "name_for_model": "fibery_cli",
+  "description_for_human": "Command-line interface for Fibery workspaces — entity CRUD, schema, views, documents, automations, plus UI-discovered endpoints.",
+  "description_for_model": "Use the `fibery` CLI to interact with Fibery workspaces. Read docs/AGENTS.md for the output contract and escalation rules. Read docs/CAPABILITIES.md before designing multi-step flows. Output defaults to JSON; exit codes follow sysexits.h. When the CLI returns 'method not found', 'unknown command', or a 404 on /api/*, invoke the auto-extension loop documented in README.md rather than retrying or fabricating workarounds.",
+  "contact_email": "kyle.adriany@gmail.com",
+  "legal_info_url": "https://github.com/kradriany/fibery-cli/blob/main/LICENSE",
+  "logo_url": "https://fibery.io/favicon.ico",
+  "api": {
+    "type": "cli",
+    "executable": "fibery",
+    "catalog": "docs/commands.json",
+    "agent_docs": "docs/AGENTS.md",
+    "capabilities": "docs/CAPABILITIES.md"
+  }
+}
