@@ -185,7 +185,7 @@ Items below are not yet wired. They're prioritized targets for the next round of
 - DB and field description updates after type creation (current API only writes descriptions at type creation)
 - DB snapshot export (entity-data dump for migrations; `file download-all` covers attachments only)
 - Cross-DB queries that traverse relations (current sub-query is single-type)
-- Embed-view blocks in rich-text (announced in Fibery's May 2026 release notes)
+- Embed blocks in rich-text — node shape captured 2026-05-23: ProseMirror node `{"type":"media","attrs":{"url":"<url>","compatibleMode":true,"dynamicContent":true,"aspectRatio":null,"nodeHeight":400,"nodeWidth":900,"nodePageWidth":true,"nodeFullWidth":false}}`. Needs a wrapper (e.g. `doc-embed --secret <s> --url <url>` or `doc-write --append-media <url>`) that splices this node into a doc fetched via `doc --format json --raw-content` and writes it back via `doc-write --format json`. Distinct from the Space-level Embed View (`view create --body` with `fibery/type: "embed"`, already supported).
 - Validation rules, automatic-linking operators, AI page creation, user-visibility management (Nov 2025 – May 2026 release-note features)
 
 ## Testing
