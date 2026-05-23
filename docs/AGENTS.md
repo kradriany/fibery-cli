@@ -1,4 +1,4 @@
-# AGENTS.md — Using `fibery` from AI agents
+# AGENTS.md - Using `fibery` from AI agents
 
 This page is for AI agents (Claude Code, Cursor, custom LangChain workers, Goose, etc.) that call the `fibery` CLI on a user's behalf. Humans should start with [README.md](../README.md) and [USAGE.md](USAGE.md).
 
@@ -8,9 +8,9 @@ Agents need three things the CLI doesn't surface by default: a predictable outpu
 
 Companion docs:
 
-- [CAPABILITIES.md](CAPABILITIES.md) — what is and isn't supported today
-- [INTERNAL-API.md](INTERNAL-API.md) — endpoint reference (incl. UI-discovered ones)
-- [HAR-CLI-BUILDER.md](HAR-CLI-BUILDER.md) — how this CLI was built, and how to extend it
+- [CAPABILITIES.md](CAPABILITIES.md) - what is and isn't supported today
+- [INTERNAL-API.md](INTERNAL-API.md) - endpoint reference (incl. UI-discovered ones)
+- [HAR-CLI-BUILDER.md](HAR-CLI-BUILDER.md) - how this CLI was built, and how to extend it
 
 ## Output contract
 
@@ -26,8 +26,8 @@ Companion docs:
 | `0` | Success | Continue |
 | `1` | Generic failure (HTTP non-2xx, runtime error) | Read stderr; consider escalation if stderr matches the patterns below |
 | `2` | Usage error (bad flags or args) | Fix the command and retry |
-| `3` | Authentication failure | Stop — refresh the token; do not retry on the same credentials |
-| `4` | Resource not found (entity, db, view, doc) | Stop — confirm with the user before fabricating an alternate path |
+| `3` | Authentication failure | Stop - refresh the token; do not retry on the same credentials |
+| `4` | Resource not found (entity, db, view, doc) | Stop - confirm with the user before fabricating an alternate path |
 | `75` | Discovery loop is queued behind another run | Wait or move to other work; the queue will drain |
 
 The `75` code matches `EX_TEMPFAIL` from `sysexits.h` so generic shell tooling treats it as a soft failure.
@@ -51,7 +51,7 @@ When an agent needs to test a write, mutate schema, or trial a new automation, d
 - **Designated space**: a workspace space named `Sandbox`. Create it once if missing (`fibery <workspace> space create --name Sandbox`).
 - **Entity prefix**: every test entity should be prefixed `discover-<YYYYMMDD-HHMM>-<short-action>`. Makes runs trivially scannable and cleanable.
 - **Never write to production from a discovery run.** If `--where` returns a real entity, abort and surface it.
-- **No auto-cleanup.** Sandbox is throwaway — leave evidence in place for the human to inspect. The user purges on their own schedule.
+- **No auto-cleanup.** Sandbox is throwaway - leave evidence in place for the human to inspect. The user purges on their own schedule.
 
 ## Idempotency
 
@@ -61,7 +61,7 @@ When an agent needs to test a write, mutate schema, or trial a new automation, d
 | `link`, `unlink` | Yes | Replays return the same end state |
 | `create`, `batch-create` | **No** | Always check first with `query --where` |
 | `update`, `batch-update` | Yes | Same payload returns same final state |
-| `delete`, `batch-delete` | Effectively yes | Re-deleting a deleted entity returns 404 — handle gracefully |
+| `delete`, `batch-delete` | Effectively yes | Re-deleting a deleted entity returns 404 - handle gracefully |
 | `doc-write` | Conditional | `--append` is idempotent in spirit but appends each call; default-overwrite is idempotent |
 | `automation create` | **No** | Creates a new rule per invocation; query existing rules first |
 
@@ -83,7 +83,7 @@ The expected flow when the CLI returns one of the escalation signatures:
 
 ## See also
 
-- [README.md](../README.md) — overview and the auto-extension loop contract
-- [USAGE.md](USAGE.md) — full command reference
-- [CAPABILITIES.md](CAPABILITIES.md) — current coverage matrix
-- [INTERNAL-API.md](INTERNAL-API.md) — undocumented Fibery endpoints
+- [README.md](../README.md) - overview and the auto-extension loop contract
+- [USAGE.md](USAGE.md) - full command reference
+- [CAPABILITIES.md](CAPABILITIES.md) - current coverage matrix
+- [INTERNAL-API.md](INTERNAL-API.md) - undocumented Fibery endpoints

@@ -152,7 +152,7 @@ Reference docs:
 
 ## Auto-Extension Loop
 
-This CLI was bootstrapped by reverse-engineering Fibery's UI traffic — see [docs/HAR-CLI-BUILDER.md](docs/HAR-CLI-BUILDER.md). The same loop can be automated: capture the live UI for a missing action, diff the network log against known endpoints, generate a new subcommand, verify, commit. Any tooling that follows the contract below can contribute to this repo.
+This CLI was bootstrapped by reverse-engineering Fibery's UI traffic - see [docs/HAR-CLI-BUILDER.md](docs/HAR-CLI-BUILDER.md). The same loop can be automated: capture the live UI for a missing action, diff the network log against known endpoints, generate a new subcommand, verify, commit. Any tooling that follows the contract below can contribute to this repo.
 
 **Recommended trigger conditions:**
 
@@ -181,7 +181,7 @@ A reference implementation as a Claude Code skill is available; the loop is tool
 
 Items below are not yet wired. They're prioritized targets for the next round of UI-driven discovery:
 
-- Standalone space-level documents (not bound to entities) — useful as freeform notes for human or agent consumers
+- Standalone space-level documents (not bound to entities) - useful as freeform notes for human or agent consumers
 - DB and field description updates after type creation (current API only writes descriptions at type creation)
 - DB snapshot export (entity-data dump for migrations; `file download-all` covers attachments only)
 - Cross-DB queries that traverse relations (current sub-query is single-type)

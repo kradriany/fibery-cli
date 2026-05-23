@@ -48,7 +48,7 @@ Keep HAR files out of git. The repo ignores `*.har`.
 
 ## Auto-Discovery Commits
 
-Some commits land here via the auto-extension loop described in [README.md § Auto-Extension Loop](README.md#auto-extension-loop). They look ordinary at first glance — single-author, four-file scope, conventional message — but reviewers should treat them differently.
+Some commits land here via the auto-extension loop described in [README.md § Auto-Extension Loop](README.md#auto-extension-loop). They look ordinary at first glance - single-author, four-file scope, conventional message - but reviewers should treat them differently.
 
 ### How to recognize one
 
@@ -79,7 +79,7 @@ The Claude Code reference implementation exposes this as `/fibery-discover-rever
 
 ### Safety-gate contract (summary)
 
-Every auto-discovery commit must pass eight gates before push. Full list in [README.md § Auto-Extension Loop](README.md#auto-extension-loop). A reviewer who sees a tagged commit can assume all eight passed — but if any one looks suspect, revert and open an issue.
+Every auto-discovery commit must pass eight gates before push. Full list in [README.md § Auto-Extension Loop](README.md#auto-extension-loop). A reviewer who sees a tagged commit can assume all eight passed - but if any one looks suspect, revert and open an issue.
 
 ## Releases
 
