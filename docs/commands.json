@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json.schemastore.org/llms-cli-catalog",
+  "name": "fibery",
+  "description": "Command-line interface for Fibery workspaces. Wraps the official HTTP API plus 15+ UI-discovered endpoints.",
+  "homepage": "https://github.com/kradriany/fibery-cli",
+  "agent_doc": "docs/AGENTS.md",
+  "capabilities_doc": "docs/CAPABILITIES.md",
+  "internal_api_doc": "docs/INTERNAL-API.md",
+  "extension_protocol": {
+    "discovery": "Capture Fibery UI traffic via HAR or DevTools, diff against docs/INTERNAL-API.md, generate a new subcommand, commit with tag auto/discover/<YYYYMMDD-HHMMSS>.",
+    "trigger_phrases": [
+      "method not found",
+      "unknown command",
+      "not implemented",
+      "404"
+    ]
+  },
+  "global_flags": [
+    "-o",
+    "--output",
+    "-h",
+    "--help"
+  ],
+  "output_formats": [
+    "json",
+    "raw",
+    "table"
+  ],
+  "exit_codes": {
+    "0": "success",
+    "1": "generic failure",
+    "2": "usage error",
+    "3": "authentication failure",
+    "4": "resource not found",
+    "75": "discovery loop queued"
+  },
+  "subcommands": {
+    "date": {
+      "summary": "Current date and workspace info",
+      "args": [
+        "-h"
+      ]
+    },
+    "dbs": {
+      "summary": "List databases in the workspace",
+      "args": [
+        "--all",
+        "-h"
+      ]
+    },
+    "describe": {
+      "summary": "Describe fields and meta for one database",
+      "args": [
+        "-h"
+      ]
+    },
+    "query": {
+      "summary": "Query entities from a database",
+      "args": [
+        "--json-query",
+        "--limit",
+        "--offset",
+        "--order-by",
+        "--order-desc",
+        "--params",
+        "--select",
+        "--where",
+        "-h"
+      ]
+    },
+    "create": {
+      "summary": "Create an entity in a database",
+      "args": [
+        "--description",
+        "--description-field",
+        "--description-file",
+        "--fields",
+        "--fields-file",
+        "-h"
+      ]
+    },
+    "update": {
+      "summary": "Update an entity by ID",
+      "args": [
+        "--fields",
+        "--fields-file",
+        "--type",
+        "-h"
+      ]
+    },
+    "batch-create": {
+      "summary": "Create many entities from a JSON array file",
+      "args": [
+        "--file",
+        "-h"
+      ]
+    },
+    "delete": {
+      "summary": "Delete an entity by ID (destructive)",
+      "args": [
+        "--type",
+        "--yes",
+        "-h"
+      ]
+    },
+    "batch-delete": {
+      "summary": "Delete many entities by ID (destructive)",
+      "args": [
+        "--ids",
+        "--type",
+        "--yes",
+        "-h"
+      ]
+    },
+    "link": {
+      "summary": "Add items to a collection/relation field",
+      "args": [
+        "--by-name",
+        "--field",
+        "--items",
+        "--type",
+        "-h"
+      ]
+    },
+    "unlink": {
+      "summary": "Remove items from a collection/relation field",
+      "args": [
+        "--by-name",
+        "--field",
+        "--items",
+        "--type",
+        "-h"
+      ]
+    },
+    "space": {
+      "summary": "Manage spaces (create, list, delete)",
+      "args": [
+        "-h"
+      ]
+    },
+    "event-seq": {
+      "summary": "Get current event sequence ID for sync",
+      "args": [
+        "-h"
+      ]
+    },
+    "docs-batch": {
+      "summary": "Fetch multiple documents by secret (NDJSON output)",
+      "args": [
+        "--format",
+        "--secrets",
+        "--secrets-file",
+        "-h"
+      ]
+    },
+    "docs-sync": {
+      "summary": "Incremental doc sync to local cache",
+      "args": [
+        "--cache-dir",
+        "--field",
+        "--format",
+        "--full",
+        "--limit",
+        "--type",
+        "-h"
+      ]
+    },
+    "script": {
+      "summary": "Manage Fibery automation scripts as local source",
+      "args": [
+        "-h"
+      ]
+    },
+    "clip": {
+      "summary": "Create a Fibery entity from clipped text/markdown",
+      "args": [
+        "-h"
+      ]
+    },
+    "tweak": {
+      "summary": "Validate/import/export Fiberflow-style tweak packages",
+      "args": [
+        "-h"
+      ]
+    },
+    "connector": {
+      "summary": "Scaffold and run simple Fibery action specs",
+      "args": [
+        "-h"
+      ]
+    },
+    "automation": {
+      "summary": "Manage automations (REST API)",
+      "args": [
+        "-h"
+      ]
+    },
+    "view": {
+      "summary": "Manage views (list, create)",
+      "args": [
+        "-h"
+      ]
+    },
+    "page": {
+      "summary": "Manage standalone documents (pages) within spaces",
+      "args": [
+        "-h"
+      ]
+    },
+    "button": {
+      "summary": "Manage automation buttons",
+      "args": [
+        "-h"
+      ]
+    },
+    "doc": {
+      "summary": "Fetch rich-text document content by secret",
+      "args": [
+        "--format",
+        "--raw-content",
+        "-h"
+      ]
+    },
+    "doc-write": {
+      "summary": "Write rich-text document content (PUT)",
+      "args": [
+        "--append",
+        "--content",
+        "--content-file",
+        "--format",
+        "-h"
+      ]
+    },
+    "comments": {
+      "summary": "Fetch threaded comments on an entity",
+      "args": [
+        "--format",
+        "--type",
+        "--with-content",
+        "-h"
+      ]
+    },
+    "comment-add": {
+      "summary": "Add a comment to an entity",
+      "args": [
+        "--content",
+        "--content-file",
+        "--type",
+        "-h"
+      ]
+    },
+    "graphql": {
+      "summary": "Execute a GraphQL query against a space",
+      "args": [
+        "--query",
+        "--variables",
+        "-h"
+      ]
+    },
+    "webhook": {
+      "summary": "Manage webhooks",
+      "args": [
+        "-h"
+      ]
+    },
+    "schema": {
+      "summary": "Schema manipulation (sandbox spaces only recommended)",
+      "args": [
+        "-h"
+      ]
+    },
+    "file": {
+      "summary": "File operations: download, upload, sign",
+      "args": [
+        "-h"
+      ]
+    }
+  }
+}
