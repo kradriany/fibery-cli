@@ -150,6 +150,44 @@ Reference docs:
 - [docs/INTERNAL-API.md](docs/INTERNAL-API.md)
 - [docs/HAR-CLI-BUILDER.md](docs/HAR-CLI-BUILDER.md)
 
+## Auto-Extension Loop
+
+This CLI was bootstrapped by reverse-engineering Fibery's UI traffic — see [docs/HAR-CLI-BUILDER.md](docs/HAR-CLI-BUILDER.md). The same loop can be automated: capture the live UI for a missing action, diff the network log against known endpoints, generate a new subcommand, verify, commit. Any tooling that follows the contract below can contribute to this repo.
+
+**Recommended trigger conditions:**
+
+- A user or agent explicitly requests a missing capability
+- A `fibery` invocation exits with `method not found`, `unknown command`, or a 404 on a Fibery URL
+- A scheduled diff of `fibery.app/get-version` reports a new build hash
+
+**Recommended safety gates before pushing:**
+
+1. Network diff yields ≥1 endpoint not already in [docs/INTERNAL-API.md](docs/INTERNAL-API.md)
+2. Token replay returns 2xx for every wired endpoint
+3. `ast.parse(fibery)` is clean
+4. `uv run --script fibery --help` exits 0 and lists the new subcommand
+5. Independent code review (human or LLM) returns no blocking findings
+6. New subcommand runs against a sandbox space and returns 2xx with non-empty body
+7. `git diff --stat` touches only: `fibery`, `docs/INTERNAL-API.md`, `docs/USAGE.md`, `CHANGELOG.md`
+8. Working tree was clean before the run
+
+**Tagging convention:** auto-generated commits use the tag `auto/discover/<YYYYMMDD-HHMMSS>`. To revert: `git revert <tag> && git push`.
+
+**Sandbox convention:** use a dedicated workspace space named `Sandbox` and prefix test entities with `discover-<YYYYMMDD-HHMM>-` to avoid collisions between runs.
+
+A reference implementation as a Claude Code skill is available; the loop is tool-agnostic and can be implemented in any framework that can drive a browser (Playwright, Puppeteer, Selenium, Chrome DevTools Protocol directly) and observe the network log.
+
+### Known capability gaps
+
+Items below are not yet wired. They're prioritized targets for the next round of UI-driven discovery:
+
+- Standalone space-level documents (not bound to entities) — useful as freeform notes for human or agent consumers
+- DB and field description updates after type creation (current API only writes descriptions at type creation)
+- DB snapshot export (entity-data dump for migrations; `file download-all` covers attachments only)
+- Cross-DB queries that traverse relations (current sub-query is single-type)
+- Embed-view blocks in rich-text (announced in Fibery's May 2026 release notes)
+- Validation rules, automatic-linking operators, AI page creation, user-visibility management (Nov 2025 – May 2026 release-note features)
+
 ## Testing
 
 ```bash
