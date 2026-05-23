@@ -121,7 +121,7 @@ Linux and Windows options:
 | Automations | `automation ...`, `button ...` | rules, buttons, actions |
 | Other | `graphql`, `webhook`, `event-seq` | passthrough and sync helpers |
 
-See [docs/USAGE.md](docs/USAGE.md) for the full command reference.
+See [docs/USAGE.md](docs/USAGE.md) for the full command reference, [docs/AGENTS.md](docs/AGENTS.md) for AI-agent integration guidance, and [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for a current coverage matrix.
 
 ## Undocumented Endpoints
 
