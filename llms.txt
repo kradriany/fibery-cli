@@ -1,0 +1,36 @@
+# fibery-cli
+
+> Command-line interface for Fibery workspaces. Wraps the official HTTP API plus 15+ UI-discovered endpoints. Designed for human and AI agent consumers.
+
+This repo follows the [llms.txt](https://llmstxt.org/) convention to make machine-readable documentation discoverable.
+
+## Primary docs
+
+- [README.md](README.md): Overview, install, credentials, command index, auto-extension loop
+- [docs/AGENTS.md](docs/AGENTS.md): Output contract, exit codes, error signatures, sandbox conventions, idempotency, escalation flow
+- [docs/CAPABILITIES.md](docs/CAPABILITIES.md): Point-in-time matrix of what is and isn't supported
+- [docs/USAGE.md](docs/USAGE.md): Full command reference
+- [docs/INTERNAL-API.md](docs/INTERNAL-API.md): UI-discovered Fibery endpoints (request shapes, samples)
+- [docs/HAR-CLI-BUILDER.md](docs/HAR-CLI-BUILDER.md): How this CLI was built; protocol for extending it
+- [docs/commands.json](docs/commands.json): Machine-readable catalog of every subcommand, flags, exit codes
+
+## Optional
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): Auto-discovery commit conventions, reviewer checklist
+- [CHANGELOG.md](CHANGELOG.md): Release log
+
+## Agent quickstart
+
+```
+# read coverage before designing a multi-step flow
+cat docs/CAPABILITIES.md
+
+# enumerate subcommands programmatically
+jq '.subcommands | keys' docs/commands.json
+
+# default output is JSON, suitable for piping into agents
+fibery <workspace> query "Space/Type" --where '...' -o json
+
+# on "method not found" / "unknown command" / 404, escalate via the auto-extension loop
+# instead of fabricating workarounds
+```
