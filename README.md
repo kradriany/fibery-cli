@@ -121,7 +121,7 @@ Linux and Windows options:
 | Automations | `automation ...`, `button ...` | rules, buttons, actions |
 | Other | `graphql`, `webhook`, `event-seq` | passthrough and sync helpers |
 
-See [docs/USAGE.md](docs/USAGE.md) for the full command reference, [docs/AGENTS.md](docs/AGENTS.md) for AI-agent integration guidance, and [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for a current coverage matrix.
+See [docs/USAGE.md](docs/USAGE.md) for the full command reference, [docs/AGENTS.md](docs/AGENTS.md) for AI-agent integration guidance, [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for the current coverage matrix, and [docs/AGENT-PLAYBOOK.md](docs/AGENT-PLAYBOOK.md) for the catalog of known walls and workarounds.
 
 ## Undocumented Endpoints
 
@@ -185,7 +185,7 @@ Items below are not yet wired. They're prioritized targets for the next round of
 - DB and field description updates after type creation (current API only writes descriptions at type creation)
 - DB snapshot export (entity-data dump for migrations; `file download-all` covers attachments only)
 - Cross-DB queries that traverse relations (current sub-query is single-type)
-- Embed blocks in rich-text — node shape captured 2026-05-23: ProseMirror node `{"type":"media","attrs":{"url":"<url>","compatibleMode":true,"dynamicContent":true,"aspectRatio":null,"nodeHeight":400,"nodeWidth":900,"nodePageWidth":true,"nodeFullWidth":false}}`. Needs a wrapper (e.g. `doc-embed --secret <s> --url <url>` or `doc-write --append-media <url>`) that splices this node into a doc fetched via `doc --format json --raw-content` and writes it back via `doc-write --format json`. Distinct from the Space-level Embed View (`view create --body` with `fibery/type: "embed"`, already supported).
+- Embed blocks in rich-text (node shape live-captured 2026-05-23, no wrapper yet). Detail in [docs/AGENT-PLAYBOOK.md § L2](docs/AGENT-PLAYBOOK.md#l2-no-shortcut-to-embed-a-url-inside-a-rich-text-field).
 - Validation rules, automatic-linking operators, AI page creation, user-visibility management (Nov 2025 – May 2026 release-note features)
 
 ## Testing

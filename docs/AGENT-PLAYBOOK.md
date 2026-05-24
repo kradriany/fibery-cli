@@ -22,7 +22,25 @@ For every wall: the symptom you'll see, the underlying limitation, and the worka
 
 **Symptom**: `doc-write --format html` with a raw `<iframe>` is silently stripped by Fibery's sanitizer. The native UI `/embed` action inserts a ProseMirror `media` node, not an `embed` node.
 
-**Workaround**: have the user `/embed` once in the UI to give you the exact `media` node shape, read the doc back with `fibery <ws> doc <secret> --format json --raw-content`, copy the node, and reuse the shape for future embeds. The captured shape lives in memory `reference_fibery_rtf_embed_node_shape.md`.
+**Workaround**: append a media node to the doc and write back via `--format json`. Live-captured shape (Sandbox entity #58, 2026-05-23):
+
+```json
+{
+  "type": "media",
+  "attrs": {
+    "url": "<URL>",
+    "compatibleMode": true,
+    "dynamicContent": true,
+    "aspectRatio": null,
+    "nodeHeight": 400,
+    "nodeWidth": 900,
+    "nodePageWidth": true,
+    "nodeFullWidth": false
+  }
+}
+```
+
+Required attr: `url`. Insert at the top level under `doc.content` (same level as paragraph and heading). The same memory note (`reference_fibery_rtf_embed_node_shape.md`) covers both this URL-embed variant and the file-attachment variant.
 
 **Tracking**: Cluster 1, ticket C1.3 - a `doc-write <secret> --embed-url <url>` flag.
 

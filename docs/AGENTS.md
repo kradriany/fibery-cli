@@ -32,6 +32,8 @@ Companion docs:
 
 The `75` code matches `EX_TEMPFAIL` from `sysexits.h` so generic shell tooling treats it as a soft failure.
 
+**Pipeline gotcha**: `fibery ... | tee log | head` returns the exit code of `head`, not of `fibery`. Bash reports `$?` for the last command in a pipeline by default. To check the CLI's exit code through a pipeline, either set `set -o pipefail` first, or read `${PIPESTATUS[0]}` in bash. This has surfaced in real agent sessions: an exit-0 read after a piped `fibery` call masked an underlying API error.
+
 ## Error signatures that warrant escalation
 
 If stderr or the HTTP body contains any of these phrases, the missing capability cannot be solved by retrying. Invoke the auto-extension loop (see [README.md § Auto-Extension Loop](../README.md#auto-extension-loop)) instead:
